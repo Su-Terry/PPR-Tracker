@@ -1,0 +1,23 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Secrets — never commit
+.env
+
+# Runtime state & caches — machine-local, may contain portfolio data
+data/scan_history/
+data/dip_buy_candidates.json
+data/auctions_cache.json
+data/valuation_cache.json
+data/plots/
+
+# Claude Code local settings (contains absolute paths)
+.claude/settings.local.json

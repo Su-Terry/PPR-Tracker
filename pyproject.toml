@@ -1,0 +1,20 @@
+[project]
+name = "ppr-tracker"
+version = "0.1.0"
+description = "Alpha Strategist — CFO Warden System (跨台美股 Agentic AI 監控系統)"
+requires-python = ">=3.12"
+dependencies = [
+    "apscheduler>=3.11.2",
+    "fastmcp>=3.2.4",
+    "google-genai>=2.0.0",
+    "matplotlib>=3.10.9",
+    "pandas>=3.0.2",
+    "requests>=2.33.1",
+    "slack-bolt>=1.28.0",
+    "yfinance>=1.3.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
+]

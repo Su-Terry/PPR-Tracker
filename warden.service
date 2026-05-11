@@ -1,0 +1,43 @@
+# Alpha Strategist — CFO Warden System
+# systemd unit file (V1.1)
+#
+# This file is generated/updated by deploy.sh.
+# Do NOT edit manually — re-run deploy.sh to regenerate with correct paths.
+#
+# Manual install (if deploy.sh is unavailable):
+#   sudo cp warden.service /etc/systemd/system/warden.service
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now warden
+
+[Unit]
+Description=Alpha Strategist — CFO Warden System (Slack Bot + APScheduler)
+Documentation=https://github.com/YOUR_USERNAME/ppr_tracker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=__USER__
+WorkingDirectory=__PROJECT_DIR__
+EnvironmentFile=__PROJECT_DIR__/.env
+
+# Full path to uv is required; systemd does not inherit user $PATH
+ExecStart=__UV_BIN__ run python main.py
+
+# Restart policy: always recover from crashes or OOM kills
+Restart=always
+RestartSec=10
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+# Logging: all output goes to journald (view with: journalctl -u warden -f)
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=warden
+
+# Hardening (safe for a Socket Mode bot; adjust if MCP server needs bind)
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

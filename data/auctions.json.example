@@ -1,0 +1,26 @@
+[
+  {
+    "ticker":      "2330",
+    "name":        "台積電",
+    "kind":        "增資",
+    "exchange":    "TWSE",
+    "date":        "2026-06-01",
+    "floor_price": "850"
+  },
+  {
+    "ticker":      "3008",
+    "name":        "大立光",
+    "kind":        "競拍",
+    "exchange":    "TWSE",
+    "date":        "2026-06-10",
+    "floor_price": "2100"
+  },
+  {
+    "ticker":      "6669",
+    "name":        "緯穎",
+    "kind":        "競拍",
+    "exchange":    "TPEX",
+    "date":        "2026-06-15",
+    "floor_price": "1200"
+  }
+]
