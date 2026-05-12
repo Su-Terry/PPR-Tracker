@@ -75,6 +75,35 @@ Five new/updated modules added by `feat/v2-decision-layer`. Standalone — not y
 - `src/discipline/metrics.py` — `DisciplineMetrics` dataclass + `compute_metrics()`. Four metrics: `drift_pct`, `turnover_30d`, `last_trade_days`, `discipline_score_7d`. `ActualsProvider` Protocol + `EmptyActualsProvider` stub (Sprint 3). Sprint 4 implements `JsonlActualsProvider` reading `memory/actual_trades.jsonl`. `today` injectable for deterministic testing. `discipline_score_7d = 0` when no suggestions (guard spec deviation D-S3-6).
 - Decision archive schema documented in `src/rebalancer/trade_builder.py` module docstring; example record at `tests/fixtures/sample_decision.jsonl`. Append-only, one JSON object per line, full weight vectors + source config stored.
 
+## V2.0 Sprint 4 — Slack UX (2026-05-12)
+
+Five new/updated modules added by `feat/v2-slack-ux`. `main.py` wiring deferred to Sprint 5.
+
+- `src/slack/dashboard.py` — `render_dashboard(result, metrics, market, timestamp) → list[dict]`. Pure Block Kit renderer. HOLD layout: 結論 + 紀律儀表 + expand button. Trade layout: adds 詳情 + Approve/Why/Skip buttons. Skip-tier trades shown in context block with `~strikethrough~`; excluded from Approve scope (spec deviation D-S4-1).
+- `src/slack/actuals_provider.py` — `JsonlActualsProvider` implementing Sprint 3's `ActualsProvider` Protocol. Reads `memory/actual_trades.jsonl`. Status values: `"pending_confirmation"` (Approve path, est_cost used) vs `"reconciled"` (manual `/trade add` with actual_cost known).
+- `src/portfolio/state.py` — **Updated**: `apply_trade(market, ticker, side, quantity, cash_delta)` added. Normal execution path — does NOT log WARNING (unlike `edit_holding()` emergency override). Sprint 5 broker adapter calls this on confirmed fills.
+- `src/rebalancer/conviction.py` — **Updated**: `conviction_components(ctx, score_delta_pct)` and `batch_conviction_components(contexts)` added for archival sub-component serialization.
+- `src/rebalancer/trade_builder.py` — **Updated**: `BuildResult` gains `conviction_components: dict[str, dict]` field (backward-compat, `field(default_factory=dict)`). `archive_decision()` enriches each trade dict with `conviction_components` when present. Archive schema now optionally includes per-trade `{"score_delta_pct", "constraint_binding", "cov_certainty", "consistency", "timing"}`.
+- `src/slack_bot.py` — **Updated**: 4 core commands (`!rebalance preview`, `!holdings show`, `!why`, `!trade add`), 5 dashboard action handlers (`rebalance_approve`, `rebalance_why_summary`, `rebalance_skip_plan`, `rebalance_expand`, `trade_open_modal`), 1 modal view handler (`trade_add_submit`), 7 stretch command stubs (`TODO: Sprint 5`). New path attributes: `_state_path`, `_decision_archive`, `_actual_trades_path`. New `_rebalance_fn` callback slot (wired in Sprint 5).
+
+### actual_trades.jsonl schema
+```json
+{"ticker": str, "side": "BUY"|"SELL"|"HOLD", "market": "US"|"TW",
+ "date": "YYYY-MM-DD", "system_suggested": bool,
+ "quantity": float, "filled_price": float|null,
+ "commission": float, "tax": float, "fx": float,
+ "status": "pending_confirmation"|"reconciled"}
+```
+
+### Sprint 4 spec deviations
+- D-S4-1: Per-plan Approve (single button for all Execute-tier trades). Per-trade escape via `/trade add`.
+- D-S4-2: Single-page `/trade add` modal (9 fields).
+- D-S4-3: `/why` reads latest archive entry only (no trend view).
+- D-S4-4: Conviction sub-components added to archive (additive, backward-compat).
+- D-S4-5: Ticker validation in `/trade add` is non-blocking warn (no live price feed in Sprint 4).
+- D-S4-6: `broker_adapter` call is `logger.info` stub.
+- D-S4-7: Modal trigger via button intermediary (message listeners cannot open modals directly).
+
 ---
 
 ## 🔧 開發工作流程 (Workflow, V2.0 起適用)
@@ -115,7 +144,7 @@ Five new/updated modules added by `feat/v2-decision-layer`. Standalone — not y
 | 1 | Foundation: portfolio state, sector mapping, cost profile | `feat/v2-rebalancer-foundation` | ✅ PR #1 |
 | 2 | Optimizer core: cvxpy QP, covariance, conviction score | `feat/v2-optimizer-core` | ✅ PR #2 |
 | 3 | Decision layer: trade builder, discipline metrics, rationale | `feat/v2-decision-layer` | ✅ PR #3 |
-| 4 | Slack UX: new dashboard, /trade /reconcile /cost commands | `feat/v2-slack-ux` | Planned |
+| 4 | Slack UX: new dashboard, /trade /reconcile /cost commands | `feat/v2-slack-ux` | ✅ PR #4 |
 | 5 | Integration: get_optimal_swaps adapter, schedule, ManualAdapter | `feat/v2-integration` | Planned |
 
 每個 sprint 開始前，使用者會給 Claude Code 一份 onboarding prompt + 對應的 spec 章節指引。

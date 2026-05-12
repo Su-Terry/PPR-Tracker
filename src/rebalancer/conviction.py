@@ -125,6 +125,54 @@ def execution_tier(conviction: float) -> Literal["Execute", "Watch", "Skip"]:
     return "Skip"
 
 
+def conviction_components(
+    ctx: ConvictionContext,
+    score_delta_pct: float,
+) -> dict[str, float]:
+    """
+    Return the five normalized sub-component values for a single trade.
+
+    Parameters
+    ----------
+    ctx:
+        ConvictionContext for this trade.
+    score_delta_pct:
+        Pre-computed percentile rank of ctx.score_delta in [0.0, 1.0].
+        This is batch-relative, so the caller must supply it (computed in
+        compute_convictions or batch_conviction_components).
+
+    Returns
+    -------
+    dict with keys: score_delta_pct, constraint_binding, cov_certainty,
+    consistency, timing — each in [0.0, 1.0], rounded to 4 d.p.
+    """
+    return {
+        "score_delta_pct": round(score_delta_pct, 4),
+        "constraint_binding": round(_normalize_constraint_binding(ctx.bindings), 4),
+        "cov_certainty": round(_normalize_cov_certainty(ctx.days_available), 4),
+        "consistency": round(_normalize_consistency(ctx.recent_direction), 4),
+        "timing": round(_normalize_timing(ctx.days_since_last_trade), 4),
+    }
+
+
+def batch_conviction_components(
+    contexts: list[ConvictionContext],
+) -> list[dict[str, float]]:
+    """
+    Compute sub-component dicts for a batch of contexts.
+
+    Handles the batch-relative score_delta_pct percentile rank internally.
+    Returns one dict per context in the same order.
+    """
+    if not contexts:
+        return []
+    all_deltas = [c.score_delta for c in contexts]
+    return [
+        conviction_components(ctx, _normalize_score_delta(ctx.score_delta, all_deltas))
+        for ctx in contexts
+    ]
+
+
 # ── Private helpers ───────────────────────────────────────────────────────────
 
 def _score_one(ctx: ConvictionContext, all_deltas: list[float]) -> float:

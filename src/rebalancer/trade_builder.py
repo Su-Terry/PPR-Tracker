@@ -44,6 +44,7 @@ from src.rebalancer.config import RebalanceConfig
 from src.rebalancer.conviction import (
     ConstraintBinding,
     ConvictionContext,
+    batch_conviction_components,
     compute_convictions,
     execution_tier,
 )
@@ -158,12 +159,18 @@ class BuildResult:
         "low_notional". Empty when is_hold=False.
     market:
         "US" or "TW".
+    conviction_components:
+        Per-ticker conviction sub-component dicts for archival (Sprint 4).
+        Keys: score_delta_pct, constraint_binding, cov_certainty,
+        consistency, timing — each in [0.0, 1.0]. Empty when is_hold=True
+        or when build_trades was called without covariance data.
     """
 
     trades: list[Trade]
     is_hold: bool
     hold_reasons: list[str]
     market: Literal["US", "TW"]
+    conviction_components: dict[str, dict] = field(default_factory=dict)
 
 
 def build_trades(
@@ -311,8 +318,10 @@ def build_trades(
         )
 
     conviction_scores = compute_convictions(conviction_contexts)
+    all_components = batch_conviction_components(conviction_contexts)
 
     # Build Trade objects
+    ticker_components: dict[str, dict] = {}
     trades: list[Trade] = []
     for idx, i in enumerate(candidate_indices):
         ticker = tickers[i]
@@ -370,6 +379,7 @@ def build_trades(
                 bindings=binding_names,
             )
         )
+        ticker_components[ticker] = all_components[idx]
 
     if not trades:
         return BuildResult(trades=[], is_hold=True, hold_reasons=["min_turnover"], market=market)
@@ -384,7 +394,13 @@ def build_trades(
     if hold_reasons:
         return BuildResult(trades=[], is_hold=True, hold_reasons=hold_reasons, market=market)
 
-    return BuildResult(trades=trades, is_hold=False, hold_reasons=[], market=market)
+    return BuildResult(
+        trades=trades,
+        is_hold=False,
+        hold_reasons=[],
+        market=market,
+        conviction_components=ticker_components,
+    )
 
 
 def detect_bindings(
@@ -499,6 +515,13 @@ def archive_decision(
     """
     path.parent.mkdir(parents=True, exist_ok=True)
 
+    def _enrich_trade(t: Trade) -> dict:
+        d = t.to_dict()
+        comp = result.conviction_components.get(t.ticker)
+        if comp:
+            d["conviction_components"] = comp
+        return d
+
     record = {
         "timestamp": datetime.now(_TZ_TAIPEI).isoformat(),
         "market": result.market,
@@ -507,7 +530,7 @@ def archive_decision(
         "tickers": tickers,
         "w_target": optimize_result.w_target.tolist(),
         "w_current": w_current.tolist(),
-        "trades": [t.to_dict() for t in result.trades],
+        "trades": [_enrich_trade(t) for t in result.trades],
         "config": {
             "market": config.market,
             "lambda_score": config.lambda_score,
