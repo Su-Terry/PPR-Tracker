@@ -1,0 +1,26 @@
+{
+  "version": 1,
+  "last_updated": "2026-05-12T00:00:00+08:00",
+  "us_buy": {
+    "rate": 0.0001,
+    "min": 0.01,
+    "source": "default"
+  },
+  "us_sell": {
+    "rate": 0.0001,
+    "min": 0.01,
+    "source": "default"
+  },
+  "tw_buy": {
+    "rate": 0.001425,
+    "min": 20.0,
+    "source": "default"
+  },
+  "tw_sell": {
+    "rate": 0.001425,
+    "min": 20.0,
+    "source": "default"
+  },
+  "tw_sec_tax": 0.003,
+  "fx_twd_usd_spread_bps": 45.0
+}

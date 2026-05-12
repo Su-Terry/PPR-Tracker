@@ -34,3 +34,10 @@
 - `/src/mcp_servers/`：存放 FastMCP 的 API Gateway 程式碼。
 - `/src/strategies/`：存放量化邏輯（如修正版林區公式）的純 Python 腳本。
 - `/src/notifications/`：存放 Slack/Discord Webhook 推播邏輯。
+
+## V2.0 Sprint 1 — Foundation Data Layer (2026-05-12)
+
+Three new modules were added by `feat/v2-rebalancer-foundation`. They are standalone and not yet wired into `main.py` — V1.1 behavior is unchanged.
+- `src/portfolio/state.py` — JSON-backed `PortfolioState` dataclass (cash, holdings, IPO subscriptions, lockup tickers per spec §7.1–7.2). State file lives at `data/portfolio_state.json` (not committed; create with `PortfolioState.create_empty().save(path)`).
+- `data/sector_mapping.csv` — L1/L2 sector classification for optimizer `max_sector` constraints (spec §7.3). Missing tickers fall back to `("其他", "unmapped")` at runtime and are logged.
+- `src/cost/profile.py` — `CostProfile` dataclass with §6.1 textbook defaults, `/cost set` manual override, and data collection stub for V2.1 statistical learning (spec §6.2, §7.6). Default file `data/cost_profile.json` is committed with IBKR-like US rates and Cathay pre-discount TW rates.
