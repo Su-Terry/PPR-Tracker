@@ -70,12 +70,20 @@ class ConvictionContext:
         Calendar days since the last executed trade on this ticker.
         Use 0 if the ticker was traded very recently; use a large value (e.g. 999)
         if it has never been traded in the history.
+    recent_direction:
+        Consistency of recent system recommendations for this ticker.
+        Range [-10, 10]: +N means N of the last 10 archived decisions recommended
+        the same direction as the current trade; -N means opposite. 0 = neutral
+        (no history or equal split). Populated by trade_builder from
+        memory/rebalance_decisions.jsonl; defaults to 0 (neutral stub) when
+        the archive is empty or the ticker has no prior decisions.
     """
 
     score_delta: float
     bindings: list[ConstraintBinding] = field(default_factory=list)
     days_available: int = 0
     days_since_last_trade: int = 0
+    recent_direction: int = 0
 
 
 def compute_convictions(contexts: list[ConvictionContext]) -> list[float]:
@@ -123,7 +131,7 @@ def _score_one(ctx: ConvictionContext, all_deltas: list[float]) -> float:
     c_score = _normalize_score_delta(ctx.score_delta, all_deltas)
     c_binding = _normalize_constraint_binding(ctx.bindings)
     c_cov = _normalize_cov_certainty(ctx.days_available)
-    c_consist = _normalize_consistency()
+    c_consist = _normalize_consistency(ctx.recent_direction)
     c_timing = _normalize_timing(ctx.days_since_last_trade)
 
     raw = (
@@ -160,13 +168,16 @@ def _normalize_cov_certainty(days_available: int, ideal: int = 252) -> float:
     return min(days_available / ideal, 1.0)
 
 
-def _normalize_consistency() -> float:
+def _normalize_consistency(recent_direction: int) -> float:
     """
-    Stub returning neutral 0.5.
-    TODO(Sprint 3): read memory/rebalance_decisions.jsonl and check whether
-    recent system recommendations for this ticker have been consistent in direction.
+    Linear scale: -10 → 0.0, 0 → 0.5, +10 → 1.0. Clamped to [0, 1].
+
+    recent_direction is the net same-minus-opposite count across the last 10
+    archived decisions for this ticker (range [-10, 10]). Populated by
+    trade_builder from memory/rebalance_decisions.jsonl. Defaults to 0
+    when the archive is empty, giving a neutral score of 0.5.
     """
-    return 0.5
+    return max(0.0, min((recent_direction + 10) / 20, 1.0))
 
 
 def _normalize_timing(days_since_last_trade: int) -> float:

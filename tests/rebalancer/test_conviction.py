@@ -188,3 +188,63 @@ class TestExecutionTier:
 
     def test_skip_at_0(self):
         assert execution_tier(0.0) == "Skip"
+
+
+# ── _normalize_consistency: Sprint 3 upgrade ──────────────────────────────────
+
+class TestNormalizeConsistency:
+    def test_neutral_direction_gives_0_5(self):
+        assert _normalize_consistency(0) == pytest.approx(0.5)
+
+    def test_max_positive_gives_1_0(self):
+        assert _normalize_consistency(10) == pytest.approx(1.0)
+
+    def test_max_negative_gives_0_0(self):
+        assert _normalize_consistency(-10) == pytest.approx(0.0)
+
+    def test_clamped_above_10(self):
+        assert _normalize_consistency(15) == pytest.approx(1.0)
+
+    def test_clamped_below_minus_10(self):
+        assert _normalize_consistency(-15) == pytest.approx(0.0)
+
+    def test_partial_positive(self):
+        # recent_direction=5 → (5+10)/20 = 0.75
+        assert _normalize_consistency(5) == pytest.approx(0.75)
+
+    def test_partial_negative(self):
+        # recent_direction=-5 → (-5+10)/20 = 0.25
+        assert _normalize_consistency(-5) == pytest.approx(0.25)
+
+
+# ── ConvictionContext.recent_direction ────────────────────────────────────────
+
+class TestConvictionContextRecentDirection:
+    def test_default_is_zero(self):
+        ctx = ConvictionContext(score_delta=1.0)
+        assert ctx.recent_direction == 0
+
+    def test_positive_direction_raises_conviction(self):
+        ctx_neutral = ConvictionContext(score_delta=1.0, recent_direction=0)
+        ctx_consistent = ConvictionContext(score_delta=1.0, recent_direction=10)
+        scores_neutral = compute_convictions([ctx_neutral])
+        scores_consistent = compute_convictions([ctx_consistent])
+        assert scores_consistent[0] > scores_neutral[0]
+
+    def test_negative_direction_lowers_conviction(self):
+        ctx_neutral = ConvictionContext(score_delta=1.0, recent_direction=0)
+        ctx_inconsistent = ConvictionContext(score_delta=1.0, recent_direction=-10)
+        scores_neutral = compute_convictions([ctx_neutral])
+        scores_inconsistent = compute_convictions([ctx_inconsistent])
+        assert scores_inconsistent[0] < scores_neutral[0]
+
+    def test_sprint2_contexts_still_work_without_field(self):
+        # Backward compatibility: Sprint 2 code that doesn't pass recent_direction
+        ctx = ConvictionContext(
+            score_delta=2.0,
+            bindings=[ConstraintBinding(name="sector:Tech", ratio=0.9)],
+            days_available=200,
+            days_since_last_trade=15,
+        )
+        scores = compute_convictions([ctx])
+        assert 0.0 <= scores[0] <= 10.0

@@ -65,6 +65,16 @@ Four new modules were added by `feat/v2-optimizer-core`. They are standalone and
 - `src/rebalancer/optimizer.py` — `solve_target_weights()` runs the §4.2 QP via cvxpy + CLARABEL. On infeasibility, auto-relaxes `max_turnover → max_sector → cash_floor` (+5 pp each, max 3 attempts), then returns `w0` with `infeasible=True` (spec deviation D2: returns instead of raising, to enable Sprint 4 dashboard HOLD display). Outputs an `OptimizeResult` with `relaxations_applied` for `/why` debugging.
 - `src/rebalancer/conviction.py` — `compute_convictions()` scores each trade 0–10 using five pure-rule components: `score_delta` percentile rank (40%), max constraint binding ratio (20%), cov certainty linear scale (15%), consistency neutral stub pending Sprint 3 (15%), timing days-since-last-trade (10%). `execution_tier()` maps scores to Execute/Watch/Skip per spec §4.5.
 
+## V2.0 Sprint 3 — Decision Layer (2026-05-12)
+
+Five new/updated modules added by `feat/v2-decision-layer`. Standalone — not yet wired into `main.py`. V1.1 behavior is unchanged. `conviction.py` updated (backward-compatible `recent_direction` field).
+
+- `src/rebalancer/conviction.py` — **Updated**: `ConvictionContext` gains `recent_direction: int = 0` field (range [-10, 10]). `_normalize_consistency()` now active: reads last 10 archived decisions per ticker; `(x+10)/20` linear scale. Backward compatible — Sprint 2 code using default `recent_direction=0` gets neutral 0.5 (same as the prior stub).
+- `src/rebalancer/rationale.py` — `RationaleContext` dataclass + `generate_rationale()`. Five priority rules: `overheat (RSI>75 SELL) > sector_cap > min_position > score_delta > new_position > "rebalance"` fallback. All outputs ≤ 15 chars. Optional `rsi`, `peg_ratio`, `is_discovery`, `discovery_rank` fields; Sprint 5 runner populates from quant_engine.
+- `src/rebalancer/trade_builder.py` — `Trade` + `BuildResult` dataclasses; `build_trades()` (w_target → Trade list, three-pass HOLD detection); `detect_bindings()` (post-hoc sector/position cap detection from w_target); `archive_decision()` (append to `memory/rebalance_decisions.jsonl`). `score_delta` for conviction: BUY→`scores[i]`, SELL→`-scores[i]` (cross-sectional z-scores). Binding detection: exact for sector/position caps; cannot detect cash_floor or max_turnover without solver dual values (spec deviation D-S3-7).
+- `src/discipline/metrics.py` — `DisciplineMetrics` dataclass + `compute_metrics()`. Four metrics: `drift_pct`, `turnover_30d`, `last_trade_days`, `discipline_score_7d`. `ActualsProvider` Protocol + `EmptyActualsProvider` stub (Sprint 3). Sprint 4 implements `JsonlActualsProvider` reading `memory/actual_trades.jsonl`. `today` injectable for deterministic testing. `discipline_score_7d = 0` when no suggestions (guard spec deviation D-S3-6).
+- Decision archive schema documented in `src/rebalancer/trade_builder.py` module docstring; example record at `tests/fixtures/sample_decision.jsonl`. Append-only, one JSON object per line, full weight vectors + source config stored.
+
 ---
 
 ## 🔧 開發工作流程 (Workflow, V2.0 起適用)
@@ -104,7 +114,7 @@ Four new modules were added by `feat/v2-optimizer-core`. They are standalone and
 |---|---|---|---|
 | 1 | Foundation: portfolio state, sector mapping, cost profile | `feat/v2-rebalancer-foundation` | ✅ PR #1 |
 | 2 | Optimizer core: cvxpy QP, covariance, conviction score | `feat/v2-optimizer-core` | ✅ PR #2 |
-| 3 | Decision layer: trade builder, discipline metrics, rationale | `feat/v2-decision-layer` | Planned |
+| 3 | Decision layer: trade builder, discipline metrics, rationale | `feat/v2-decision-layer` | ✅ PR #3 |
 | 4 | Slack UX: new dashboard, /trade /reconcile /cost commands | `feat/v2-slack-ux` | Planned |
 | 5 | Integration: get_optimal_swaps adapter, schedule, ManualAdapter | `feat/v2-integration` | Planned |
 
