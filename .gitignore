@@ -18,6 +18,7 @@ data/dip_buy_candidates.json
 data/auctions_cache.json
 data/valuation_cache.json
 data/plots/
+data/portfolio_state.json
 
 # Claude Code local settings (contains absolute paths)
 .claude/settings.local.json
