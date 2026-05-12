@@ -22,3 +22,4 @@ data/portfolio_state.json
 
 # Claude Code local settings (contains absolute paths)
 .claude/settings.local.json
+.coverage
