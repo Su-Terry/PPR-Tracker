@@ -377,6 +377,65 @@ class PortfolioState:
 
         self.last_updated = _now_iso()
 
+    def apply_trade(
+        self,
+        market: Literal["US", "TW"],
+        ticker: str,
+        side: Literal["BUY", "SELL"],
+        quantity: float,
+        cash_delta: float,
+    ) -> None:
+        """
+        Record an executed trade: update holdings and cash atomically.
+
+        Use for all normal execution paths (e.g., Approve button, /trade add).
+        Unlike edit_holding(), this does NOT log a WARNING and does NOT count
+        toward the emergency-override monitoring metric (spec §10.4).
+
+        cash_delta is caller-computed:
+            BUY:  -(quantity * filled_price + commission + tax)
+            SELL: +(quantity * filled_price - commission - tax)
+
+        Args:
+            market:     "US" or "TW".
+            ticker:     Ticker symbol (e.g. "NVDA", "2330.TW").
+            side:       "BUY" or "SELL".
+            quantity:   Absolute share count (positive).
+            cash_delta: Signed cash change in market currency.
+
+        Raises:
+            ValueError: quantity <= 0 or unknown market.
+        """
+        if quantity <= 0:
+            raise ValueError(
+                f"[PORTFOLIO] apply_trade 拒絕非正數量：{ticker}  quantity={quantity}"
+            )
+        if market == "US":
+            holdings = self.us_holdings
+        elif market == "TW":
+            holdings = self.tw_holdings
+        else:
+            raise ValueError(f"[PORTFOLIO] 未知市場代碼：{market!r}")
+
+        current_qty = holdings.get(ticker, 0.0)
+        new_qty = current_qty + quantity if side == "BUY" else current_qty - quantity
+
+        if new_qty <= 0:
+            holdings.pop(ticker, None)
+        else:
+            holdings[ticker] = new_qty
+
+        if market == "US":
+            self.us_cash_usd += cash_delta
+        else:
+            self.tw_cash_twd += cash_delta
+
+        self.last_updated = _now_iso()
+        logger.info(
+            "[PORTFOLIO] 成交記錄：%s %s %s  qty=%.4f  cash_delta=%.2f",
+            side, ticker, market, quantity, cash_delta,
+        )
+
     def sync_holdings_from_csv(
         self,
         csv_path: Path,
