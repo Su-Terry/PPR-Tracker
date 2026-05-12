@@ -56,6 +56,15 @@ Three new modules were added by `feat/v2-rebalancer-foundation`. They are standa
 - `data/sector_mapping.csv` — L1/L2 sector classification for optimizer `max_sector` constraints (spec §7.3). Missing tickers fall back to `("其他", "unmapped")` at runtime and are logged.
 - `src/cost/profile.py` — `CostProfile` dataclass with §6.1 textbook defaults, `/cost set` manual override, and data collection stub for V2.1 statistical learning (spec §6.2, §7.6). Default file `data/cost_profile.json` is committed with IBKR-like US rates and Cathay pre-discount TW rates.
 
+## V2.0 Sprint 2 — Optimizer Core (2026-05-12)
+
+Four new modules were added by `feat/v2-optimizer-core`. They are standalone and not yet wired into `main.py` — V1.1 behavior is unchanged. New runtime deps: `cvxpy`, `clarabel`, `scikit-learn`, `numpy` (direct).
+
+- `src/rebalancer/config.py` — `RebalanceConfig` frozen dataclass (spec §4.3 + §7.4). `us_default()` and `tw_default()` class methods carry all constraint and lambda parameters. `min_total_turnover` uses the L1 norm (buy + sell summed separately), so the default 0.02 equals ~1% one-way equivalent.
+- `src/rebalancer/cov_estimator.py` — `estimate_covariance()` returns a `CovEstimate` with an annualised N×N matrix via Ledoit-Wolf shrinkage (scikit-learn). Falls back to a diagonal matrix when the common-window row count is below `lookback_days_min` (spec §11 Risk row 4). Cash/safe-haven proxies (BOXX, SGOV) do not cause singularity — Ledoit-Wolf's shrinkage target guarantees PSD; the diagonal fallback uses a 1%-vol prior for tickers with < 5 data points.
+- `src/rebalancer/optimizer.py` — `solve_target_weights()` runs the §4.2 QP via cvxpy + CLARABEL. On infeasibility, auto-relaxes `max_turnover → max_sector → cash_floor` (+5 pp each, max 3 attempts), then returns `w0` with `infeasible=True` (spec deviation D2: returns instead of raising, to enable Sprint 4 dashboard HOLD display). Outputs an `OptimizeResult` with `relaxations_applied` for `/why` debugging.
+- `src/rebalancer/conviction.py` — `compute_convictions()` scores each trade 0–10 using five pure-rule components: `score_delta` percentile rank (40%), max constraint binding ratio (20%), cov certainty linear scale (15%), consistency neutral stub pending Sprint 3 (15%), timing days-since-last-trade (10%). `execution_tier()` maps scores to Execute/Watch/Skip per spec §4.5.
+
 ---
 
 ## 🔧 開發工作流程 (Workflow, V2.0 起適用)
@@ -94,7 +103,7 @@ Three new modules were added by `feat/v2-rebalancer-foundation`. They are standa
 | Sprint | 範圍 | Branch | 狀態 |
 |---|---|---|---|
 | 1 | Foundation: portfolio state, sector mapping, cost profile | `feat/v2-rebalancer-foundation` | ✅ PR #1 |
-| 2 | Optimizer core: cvxpy QP, covariance, conviction score | `feat/v2-optimizer-core` | Planned |
+| 2 | Optimizer core: cvxpy QP, covariance, conviction score | `feat/v2-optimizer-core` | ✅ PR #2 |
 | 3 | Decision layer: trade builder, discipline metrics, rationale | `feat/v2-decision-layer` | Planned |
 | 4 | Slack UX: new dashboard, /trade /reconcile /cost commands | `feat/v2-slack-ux` | Planned |
 | 5 | Integration: get_optimal_swaps adapter, schedule, ManualAdapter | `feat/v2-integration` | Planned |
