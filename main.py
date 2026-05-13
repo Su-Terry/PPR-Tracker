@@ -506,6 +506,11 @@ def _parse_args() -> argparse.Namespace:
 def main() -> None:
     global _slack_warden
 
+    # Suppress yfinance INFO chatter for the process lifetime.
+    # Placed here (not module-level) so importing main as a module
+    # does not mutate global logger state.
+    logging.getLogger("yfinance").setLevel(logging.WARNING)
+
     args = _parse_args()
 
     # ── 初始化 Slack Warden（選用）──────────────────────────────────────────

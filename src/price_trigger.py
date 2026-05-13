@@ -12,9 +12,10 @@ Market hours (Asia/Taipei)
   TW (TWSE/TPEX) : 09:00 – 13:30
   US (NYSE/NASDAQ): 21:30 – 04:00+1 (EDT offset; DST-adjusted by yfinance)
 
-Price source: yfinance fast_info (last_price vs previous_close).
+Price source: yfinance .info (regularMarketPrice / previousClose) via
+LivePriceProvider. Thread-safe — no logger mutation inside provider.
 Note: yfinance data may have a 15-minute delay for US stocks on free tier.
-This is acceptable for a ≥5 % drop alert — precision to the minute is
+This is acceptable for a ≥5% drop alert — precision to the minute is
 not required for this use case.
 """
 
@@ -24,11 +25,12 @@ import logging
 from datetime import datetime, time
 
 import pytz
-import yfinance as yf
 
 from src.data_fetcher import DATA_DIR, ScanResult, get_market_data, get_portfolio
+from src.data.price_provider import LivePriceProvider
 
 logger = logging.getLogger(__name__)
+_price_provider = LivePriceProvider()
 
 _DEFAULT_DROP_THRESHOLD = 5.0     # percent
 _TW_TZ   = pytz.timezone("Asia/Taipei")
@@ -85,44 +87,34 @@ def scan_intraday_drops(
 
     alerts: list[dict] = []
 
-    yf_log = logging.getLogger("yfinance")
-    prev_level = yf_log.level
-    yf_log.setLevel(logging.CRITICAL)  # suppress yfinance noise
+    for ticker in tickers:
+        is_tw = ticker.upper().endswith((".TW", ".TWO"))
 
-    try:
-        for ticker in tickers:
-            is_tw = ticker.upper().endswith((".TW", ".TWO"))
+        # Skip if that market isn't open
+        if is_tw and not tw_open:
+            continue
+        if not is_tw and not us_open:
+            continue
 
-            # Skip if that market isn't open
-            if is_tw and not tw_open:
+        try:
+            current    = _price_provider.get_current_price(ticker)
+            prev_close = _price_provider.get_previous_close(ticker)
+
+            if current is None or prev_close is None or prev_close == 0:
                 continue
-            if not is_tw and not us_open:
-                continue
 
-            try:
-                fi          = yf.Ticker(ticker).fast_info
-                current     = getattr(fi, "last_price",      None)
-                prev_close  = getattr(fi, "previous_close",  None)
+            change_pct = (current - prev_close) / prev_close * 100
 
-                if current is None or prev_close is None or prev_close == 0:
-                    continue
-
-                current    = float(current)
-                prev_close = float(prev_close)
-                change_pct = (current - prev_close) / prev_close * 100
-
-                if change_pct <= -threshold_pct:
-                    alerts.append({
-                        "ticker":        ticker,
-                        "current_price": current,
-                        "prev_close":    prev_close,
-                        "change_pct":    change_pct,
-                        "drop_str":      f"{change_pct:.1f}%",
-                    })
-            except Exception as exc:
-                logger.debug("[TRIGGER] %s 價格取得失敗：%s", ticker, exc)
-    finally:
-        yf_log.setLevel(prev_level)
+            if change_pct <= -threshold_pct:
+                alerts.append({
+                    "ticker":        ticker,
+                    "current_price": current,
+                    "prev_close":    prev_close,
+                    "change_pct":    change_pct,
+                    "drop_str":      f"{change_pct:.1f}%",
+                })
+        except Exception as exc:
+            logger.debug("[TRIGGER] %s 價格取得失敗：%s", ticker, exc)
 
     alerts.sort(key=lambda a: a["change_pct"])
     logger.info(

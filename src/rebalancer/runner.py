@@ -413,7 +413,8 @@ def run(
     # ── 10. Load cost profile ──────────────────────────────────────────────────
     try:
         cost_profile = CostProfile.load(_DEFAULT_COST_PATH)
-    except Exception:
+    except (OSError, ValueError) as e:
+        logger.warning("[RUNNER] cost_profile 載入失敗，使用預設值：%s", e)
         cost_profile = CostProfile.from_defaults()
 
     # ── 11. Build rationale contexts from ScanResults ─────────────────────────
