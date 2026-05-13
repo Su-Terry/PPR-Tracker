@@ -889,7 +889,7 @@ class SlackWarden:
             if not file_str:
                 out_msgs.append(f"❌ {mkt}: 找不到 CSV 檔案（請先上傳至 data/）")
                 continue
-            csv_path = Path(file_str)
+            csv_path = Path("data") / file_str if not Path(file_str).is_absolute() else Path(file_str)
             try:
                 state  = PortfolioState.load(self._state_path)
                 before = dict(state.us_holdings if mkt == "US" else state.tw_holdings)

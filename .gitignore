@@ -23,3 +23,6 @@ data/portfolio_state.json
 # Claude Code local settings (contains absolute paths)
 .claude/settings.local.json
 .coverage
+
+data/複委託庫存20260508093511.csv
+data/證券未實現彙總20260508093410.csv
