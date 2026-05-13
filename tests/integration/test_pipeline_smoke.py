@@ -247,7 +247,7 @@ class TestPipelineSmoke:
 
         # ── Step 7: Discipline metrics ─────────────────────────────────────────
         from datetime import date
-        today = date(2026, 5, 12)
+        today = date.today()
 
         metrics = compute_metrics(
             w_current=optimize_result.w_target,  # assume executed

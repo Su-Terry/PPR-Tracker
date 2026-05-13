@@ -95,7 +95,8 @@ class TestFeasibleSolve:
 
     def test_max_position_respected(self):
         result = _solve()
-        assert np.all(result.w_target <= _config().max_position + 1e-4)
+        non_cash = [i for i in range(N) if i != CASH_IDX]
+        assert np.all(result.w_target[non_cash] <= _config().max_position + 1e-4)
 
     def test_cash_floor_respected(self):
         result = _solve()
@@ -169,8 +170,9 @@ class TestInfeasibility:
 
     @staticmethod
     def _infeasible_config() -> RebalanceConfig:
-        """cash_floor=0.50 > max_position=0.40 — always infeasible."""
-        return replace(_config(), cash_floor=0.50, max_position=0.40)
+        """max_sector=0.0001 forces T0+T1 near-zero while w0 has them at 0.40.
+        Required L1 turnover (~0.80) exceeds max_turnover even after relaxation."""
+        return replace(_config(), max_sector=0.0001)
 
     def test_infeasible_returns_hold(self):
         result = _solve(config=self._infeasible_config())
@@ -261,3 +263,71 @@ class TestEffectiveCashFloor:
         """effective_cash_floor=0.30 forces w[CASH_IDX] >= 0.30 (from 0.20)."""
         result = _solve(effective_cash_floor=0.30)
         assert result.w_target[CASH_IDX] >= 0.30 - 1e-4
+
+
+# ── D-S5-16/17/18: CASH exemption, trim-only, max_position relaxation ─────────
+
+class TestOverCapConstraints:
+
+    def test_cash_not_capped_by_max_position(self):
+        """CASH exempt from max_position ceiling — cash_floor=0.50 > max_position=0.40 is feasible.
+
+        Without D-S5-16: CASH bounded above by max_position=0.40 AND below by cash_floor=0.50
+        → infeasible (ceiling < floor). With exemption: only floor=0.50 applies → feasible.
+        CASH starts at 0.70; optimizer reduces it toward cash_floor=0.50 within max_turnover=0.60.
+        """
+        cfg = replace(_config(), cash_floor=0.50, max_position=0.40, max_turnover=0.60)
+        w0 = np.array([0.10, 0.10, 0.70, 0.05, 0.05])   # CASH (idx 2) at 70%
+        result = _solve(config=cfg, w0=w0)
+        assert result.infeasible is False
+        assert result.w_target[CASH_IDX] >= 0.50 - 1e-4
+
+    def test_over_cap_position_cannot_grow(self):
+        """Trim-only: over-cap equity is bounded by w0[i], cannot grow."""
+        # T0 starts at 24% > max_position=0.20. T0 has score 2.0 (highest),
+        # so without trim-only the optimizer could want to hold/grow T0.
+        # With trim-only (D-S5-17): w_target[0] ≤ w0[0] = 0.24.
+        cfg = replace(_config(), max_position=0.20)
+        w0 = np.array([0.24, 0.20, 0.20, 0.20, 0.16])
+        result = _solve(config=cfg, w0=w0)
+        # T0 must not exceed its starting weight regardless of solve outcome
+        assert result.w_target[0] <= w0[0] + 1e-4
+
+    def test_max_position_relaxation_at_attempt_2(self):
+        """Extreme over-cap triggers max_position in relaxations and manual_trim_required."""
+        # T0 at 70% >> any relaxed cap; total turnover infeasible after all relaxations.
+        cfg = replace(_config(), max_position=0.20)
+        w0 = np.array([0.70, 0.09, 0.09, 0.09, 0.03])
+        result = _solve(config=cfg, w0=w0)
+        assert result.is_hold is True
+        assert result.infeasible is True
+        assert result.hold_reason == "manual_trim_required"
+        relaxation_str = " ".join(result.relaxations_applied)
+        assert "max_position" in relaxation_str
+
+    def test_max_position_relax_skipped_when_no_over_cap(self):
+        """Clean portfolio (no over-cap) uses 3-step chain; max_position never appears."""
+        # max_sector=0.0001 makes T0+T1 infeasible within any turnover budget —
+        # forces all 3 relaxation steps without any over-cap positions.
+        cfg = replace(_config(), max_sector=0.0001)
+        result = _solve(config=cfg)
+        assert result.is_hold is True
+        assert result.infeasible is True
+        assert result.hold_reason == "infeasible"  # not manual_trim_required
+        relaxation_str = " ".join(result.relaxations_applied)
+        assert "max_position" not in relaxation_str
+        assert "cash_floor" in relaxation_str
+
+    def test_max_position_hard_cap_at_0_30(self):
+        """max_position relaxation never exceeds _MAX_POSITION_RELAX_CAP=0.30."""
+        # Starting at 0.27: one +5pp step would yield 0.32, but cap applies → 0.30.
+        cfg = replace(_config(), max_position=0.27)
+        w0 = np.array([0.80, 0.06, 0.06, 0.05, 0.03])
+        result = _solve(config=cfg, w0=w0)
+        assert result.is_hold is True
+        for r in result.relaxations_applied:
+            if "max_position" in r:
+                after_val = float(r.split("→")[1])
+                assert after_val <= 0.30 + 1e-9, (
+                    f"max_position relaxed past 0.30: {r}"
+                )

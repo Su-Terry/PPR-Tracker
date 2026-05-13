@@ -250,7 +250,6 @@ def _trade_detail_blocks(result: BuildResult, market: str) -> list[dict]:
                         "text": "❌ Skip plan",
                         "emoji": True,
                     },
-                    "style": "danger",
                     "action_id": "rebalance_skip_plan",
                     "value": market,
                     "confirm": {

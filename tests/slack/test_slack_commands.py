@@ -416,23 +416,135 @@ class TestRebalanceApprove:
 
 # ── Tests: stretch stubs ──────────────────────────────────────────────────────
 
-class TestStretchStubs:
-    @pytest.mark.parametrize(
-        "handler_name",
-        [
-            "_on_stub_cash",
-            "_on_stub_holdings_sync",
-            "_on_stub_ipo",
-            "_on_stub_fx",
-            "_on_stub_cost",
-            "_on_stub_reconcile",
-            "_on_stub_rebalance_config",
-        ],
-    )
-    def test_stub_responds_with_sprint5(self, warden, handler_name):
+class TestRebalanceConfigCommand:
+    def test_show_no_overrides(self, warden, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
         say = _say()
-        handler = getattr(warden, handler_name)
-        handler(_msg(), say, _ctx())
-        say.assert_called_once()
-        text = say.call_args[1].get("text", "")
-        assert "Sprint 5" in text
+        warden._on_stub_rebalance_config({"text": "!rebalance config show"}, say, _ctx())
+        text = say.call_args[1]["text"]
+        assert "無 override" in text
+
+    def test_show_active_override(self, warden, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        cfg = tmp_path / "data" / "rebalance_config_override.json"
+        cfg.parent.mkdir()
+        cfg.write_text(json.dumps({"US": {"max_position": 0.99}}), encoding="utf-8")
+        say = _say()
+        warden._on_stub_rebalance_config({"text": "!rebalance config show us"}, say, _ctx())
+        text = say.call_args[1]["text"]
+        assert "max_position" in text
+        assert "0.99" in text
+
+    def test_set_writes_override_file(self, warden, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        say = _say()
+        warden._on_stub_rebalance_config(
+            {"text": "!rebalance config set us max_position 0.25"}, say, _ctx()
+        )
+        text = say.call_args[1]["text"]
+        assert "✅" in text
+        data = json.loads((tmp_path / "data" / "rebalance_config_override.json").read_text())
+        assert data["US"]["max_position"] == pytest.approx(0.25)
+
+    def test_set_invalid_market(self, warden, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        say = _say()
+        warden._on_stub_rebalance_config(
+            {"text": "!rebalance config set jp max_position 0.25"}, say, _ctx()
+        )
+        text = say.call_args[1]["text"]
+        assert "❌" in text and "market" in text
+
+    def test_set_invalid_field(self, warden, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        say = _say()
+        warden._on_stub_rebalance_config(
+            {"text": "!rebalance config set us bad_field 0.25"}, say, _ctx()
+        )
+        text = say.call_args[1]["text"]
+        assert "❌" in text and "field" in text
+
+
+class TestCashCommand:
+    def test_show_no_state_file_returns_error(self, warden):
+        say = _say()
+        warden._on_stub_cash({"text": "!cash show us"}, say, _ctx())
+        text = say.call_args[1]["text"]
+        assert "❌" in text
+
+    def test_show_returns_cash_amounts(self, warden, tmp_path):
+        from src.portfolio.state import PortfolioState
+        state = PortfolioState.create_empty()
+        state.us_cash_usd = 5_000.0
+        state.tw_cash_twd = 100_000.0
+        state.save(warden._state_path)
+        say = _say()
+        warden._on_stub_cash({"text": "!cash show"}, say, _ctx())
+        text = say.call_args[1]["text"]
+        assert "5,000.00" in text
+        assert "100,000" in text
+
+    def test_set_updates_cash(self, warden):
+        from src.portfolio.state import PortfolioState
+        state = PortfolioState.create_empty()
+        state.us_cash_usd = 1_000.0
+        state.save(warden._state_path)
+        say = _say()
+        warden._on_stub_cash({"text": "!cash set us 8000"}, say, _ctx())
+        text = say.call_args[1]["text"]
+        assert "✅" in text
+        loaded = PortfolioState.load(warden._state_path)
+        assert loaded.us_cash_usd == pytest.approx(8_000.0)
+
+    def test_adjust_reports_v21_deferral(self, warden):
+        say = _say()
+        warden._on_stub_cash({"text": "!cash adjust"}, say, _ctx())
+        assert "V2.1" in say.call_args[1]["text"]
+
+    def test_unknown_subcmd_shows_usage(self, warden):
+        say = _say()
+        warden._on_stub_cash({"text": "!cash badcmd"}, say, _ctx())
+        assert "用法" in say.call_args[1]["text"]
+
+
+class TestIpoCommand:
+    def test_list_empty(self, warden):
+        from src.portfolio.state import PortfolioState
+        PortfolioState.create_empty().save(warden._state_path)
+        say = _say()
+        warden._on_stub_ipo({"text": "!ipo list"}, say, _ctx())
+        assert "無待審" in say.call_args[1]["text"]
+
+    def test_apply_insufficient_cash_rejected(self, warden):
+        from src.portfolio.state import PortfolioState
+        state = PortfolioState.create_empty()
+        state.tw_cash_twd = 10_000.0
+        state.save(warden._state_path)
+        say = _say()
+        warden._on_stub_ipo({"text": "!ipo apply 6488.TW 500000 2026-06-01"}, say, _ctx())
+        text = say.call_args[1]["text"]
+        assert "❌" in text and "不足" in text
+
+    def test_apply_records_subscription(self, warden):
+        from src.portfolio.state import PortfolioState
+        state = PortfolioState.create_empty()
+        state.tw_cash_twd = 200_000.0
+        state.save(warden._state_path)
+        say = _say()
+        warden._on_stub_ipo({"text": "!ipo apply 6488.TW 100000 2026-06-15"}, say, _ctx())
+        assert "✅" in say.call_args[1]["text"]
+        loaded = PortfolioState.load(warden._state_path)
+        assert len(loaded.tw_pending_ipo_details) == 1
+        assert loaded.tw_cash_twd == pytest.approx(100_000.0)
+
+    def test_release_not_in_list_returns_error(self, warden):
+        from src.portfolio.state import PortfolioState
+        PortfolioState.create_empty().save(warden._state_path)
+        say = _say()
+        warden._on_stub_ipo({"text": "!ipo release 9999.TW awarded"}, say, _ctx())
+        assert "❌" in say.call_args[1]["text"]
+
+    def test_unknown_subcmd_shows_usage(self, warden):
+        say = _say()
+        warden._on_stub_ipo({"text": "!ipo badcmd"}, say, _ctx())
+        assert "用法" in say.call_args[1]["text"]

@@ -323,6 +323,7 @@ def build_trades(
     # Build Trade objects
     ticker_components: dict[str, dict] = {}
     trades: list[Trade] = []
+    _below_min_notional = 0
     for idx, i in enumerate(candidate_indices):
         ticker = tickers[i]
         side = sides[idx]
@@ -338,6 +339,13 @@ def build_trades(
             continue
 
         notional = abs(quantity) * est_price
+        if notional < config.min_trade_amount:
+            logger.debug(
+                "[TRADE] Below min_trade_amount %.0f — skipping %s %s %.0f",
+                config.min_trade_amount, ticker, side, notional,
+            )
+            _below_min_notional += 1
+            continue
         est_cost = cost_profile.estimate(market=market, side=side, notional=notional)
         est_cost_breakdown = _cost_breakdown(
             market=market, side=side, notional=notional, cost_profile=cost_profile
@@ -382,7 +390,8 @@ def build_trades(
         ticker_components[ticker] = all_components[idx]
 
     if not trades:
-        return BuildResult(trades=[], is_hold=True, hold_reasons=["min_turnover"], market=market)
+        reasons = ["low_notional"] if _below_min_notional else ["min_turnover"]
+        return BuildResult(trades=[], is_hold=True, hold_reasons=reasons, market=market)
 
     # Second-pass HOLD conditions (spec §4.7)
     hold_reasons: list[str] = []

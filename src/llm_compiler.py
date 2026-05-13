@@ -19,6 +19,7 @@ import logging
 import os
 import re
 from datetime import datetime
+from typing import Literal
 
 import pandas as pd
 import yfinance as yf
@@ -43,6 +44,7 @@ from src.state_manager import (
     check_reentry_signals,
     remove_dip_buy_candidate,
 )
+from src.strategies.scoring import efficiency_score as calculate_efficiency_score
 
 logger = logging.getLogger(__name__)
 
@@ -301,71 +303,6 @@ def _compute_haven_route(capital_usd: float = DEFAULT_CAPITAL_BLOCK) -> dict:
     }
 
 
-def calculate_efficiency_score(
-    r: ScanResult,
-    growth_weight: float = 0.7,
-    stability_weight: float = 0.3,
-    regime: MarketRegime | None = None,
-) -> float:
-    """
-    Standardized efficiency score applied uniformly to ALL assets
-    (Portfolio, Discovery, and Watch).
-
-    Base formula:
-      ma_dist    = |price − MA50| / MA50
-      base_score = (growth_weight / ratio) × (stability_weight / (1 + ma_dist))
-
-    Beta penalty (BEAR / CRASH regimes only):
-      penalty           = max(0, (beta − 1.0) × 0.2)
-      regime_multiplier = max(0, 1.0 − penalty)
-      final_score       = base_score × regime_multiplier
-
-    Examples (beta effect in BEAR):
-      beta=1.0 → multiplier=1.00  (no penalty — market-neutral)
-      beta=1.5 → multiplier=0.90  (−10 %)
-      beta=2.0 → multiplier=0.80  (−20 %)
-      beta=3.0 → multiplier=0.60  (−40 %)
-
-    Returns 0.0 for any ticker missing price, MA50, or a valid valuation ratio,
-    and for ratios ≤ 0 or infinite (guards against division-by-zero).
-
-    Args:
-        r:                ScanResult for any ticker.
-        growth_weight:    Weight applied to the inverse-PEG component (default 0.7).
-        stability_weight: Weight applied to the MA-proximity component (default 0.3).
-        regime:           Current MacroRegime; enables beta penalty when BEAR/CRASH.
-
-    Returns:
-        Non-negative float efficiency score.
-    """
-    if r.current_price is None or r.ma50 is None or r.ma50 == 0:
-        return 0.0
-
-    if r.valuation_model == "PEG" and r.modified_peg is not None:
-        ratio = r.modified_peg
-    elif r.valuation_model == "PS" and r.ps_growth_ratio is not None:
-        ratio = r.ps_growth_ratio
-    else:
-        return 0.0
-
-    if ratio <= 0 or ratio == float("inf"):
-        return 0.0
-
-    ma_dist    = abs(r.current_price - r.ma50) / r.ma50
-    base_score = (growth_weight / ratio) * (stability_weight / (1.0 + ma_dist))
-
-    # Beta penalty: systematically de-rank high-volatility assets in drawdown
-    if regime in (MarketRegime.BEAR, MarketRegime.CRASH) and r.beta is not None:
-        penalty           = max(0.0, (r.beta - 1.0) * 0.2)
-        regime_multiplier = max(0.0, 1.0 - penalty)
-        base_score       *= regime_multiplier
-        logger.debug(
-            "[SCORE] %s  beta=%.2f  penalty=%.0f%%  multiplier=%.2f  score=%.4f",
-            r.ticker, r.beta, penalty * 100, regime_multiplier, base_score,
-        )
-
-    return base_score
-
 
 def get_optimal_swaps(
     portfolio_results: list[ScanResult],
@@ -373,324 +310,69 @@ def get_optimal_swaps(
     threshold: float = 0.15,
     portfolio_df: pd.DataFrame | None = None,
     regime: MarketRegime | None = None,
+    market: Literal["US", "TW"] = "US",
 ) -> list[dict]:
-    """
-    Identify the weakest portfolio tickers and pair each with the strongest
-    Discovery target that (a) beats the score threshold and (b) passes the
-    pre-execution sector-concentration risk gate.
-
-    Algorithm (V3.0 — Pre-Execution Gate)
-    ──────────────────────────────────────
-      1. Score every portfolio ticker with calculate_efficiency_score.
-         Skip tickers with score == 0.0 (missing data — not actionable).
-      2. Bottom Tier = worst ⌊25%⌋ of scored portfolio tickers, minimum 1, max 5.
-      3. Score every Discovery ticker; Top Tier = top M by score (max 5).
-      4. Instantiate SimulatedPortfolio from current holdings.
-      5. For each Bottom Tier ticker, iterate through Top Tier candidates
-         (highest score first) and apply the risk gate:
-           a. simulate_swap() — compute synthetic post-trade holdings.
-           b. check_sector_limits() — reject if target sector > SECTOR_LIMIT_PCT.
-           c. First candidate that passes is approved; commit_swap() updates
-              SimulatedPortfolio state so the next iteration sees the real
-              post-swap world.
-      6. Sort results by score_delta descending.
-
-    Score reference (formula: (0.7/ratio) × (0.3/(1+|ma_dist|))):
-      PEG=0.3 at MA        → ~0.70   (exceptional)
-      PEG=0.5 at −2 % MA  → ~0.41   (strong buy)
-      PEG=1.0 at −5 % MA  → ~0.20   (neutral)
-      PEG=2.0 at +10 % MA → ~0.10   (weak)
-      PEG=3.5 at +20 % MA → ~0.05   (trim)
-
-    Threshold default 0.15 captures meaningful improvements (e.g. a Watch
-    portfolio ticker vs a strong Discovery buy) without triggering on noise.
+    """V2.0 adapter: delegates to runner.run() and maps BuildResult → V1.1 swap dicts.
 
     Args:
-        portfolio_results: All ScanResult objects from the current portfolio scan.
-        discovery_results: Discovery targets from scan_market_for_alpha().
-        threshold:         Minimum score improvement required to suggest a swap
-                           (default 0.15).
-        portfolio_df:      Optional DataFrame [Ticker, Shares, Cost_Basis, source]
-                           from get_portfolio() used to compute real position
-                           notionals for the SimulatedPortfolio.  When None,
-                           DEFAULT_CAPITAL_BLOCK is used for all positions.
+        portfolio_results: ScanResult objects for current portfolio holdings.
+        discovery_results: ScanResult objects for discovery candidates.
+        threshold:         Ignored in V2.0 — optimizer enforces constraints directly.
+        portfolio_df:      Ignored in V2.0 — runner reads PortfolioState from disk.
+        regime:            Forwarded to runner.run() for beta penalty in BEAR/CRASH.
+        market:            "US" or "TW" — routed to runner.run(market).
 
     Returns:
-        List of dicts with keys:
-          source_ticker  – ScanResult of the portfolio holding to sell
-          target_ticker  – ScanResult of the Discovery target to buy
-          sell_score     – efficiency score of source_ticker
-          buy_score      – efficiency score of target_ticker
-          score_delta    – buy_score − sell_score  (always > threshold)
-          friction       – pre-computed estimate_round_trip() dict (for rendering)
-          delta_metrics  – dict with peg_improvement, dist_improvement,
-                           sell_ratio, buy_ratio, sell_dist_pct, buy_dist_pct
+        List of swap dicts with V1.1-compatible keys (source_ticker, target_ticker,
+        sell_score, buy_score, score_delta, friction, delta_metrics, is_cash_flight)
+        plus the new V2.0 key conviction_delta (silently ignored by V1.1 renderers).
     """
-    # ── Score all tickers ────────────────────────────────────────────────────
-    def _ratio(r: ScanResult) -> float | None:
-        if r.valuation_model == "PEG" and r.modified_peg is not None:
-            v = r.modified_peg
-            return None if v == float("inf") else v
-        if r.valuation_model == "PS" and r.ps_growth_ratio is not None:
-            v = r.ps_growth_ratio
-            return None if v == float("inf") else v
-        return None
+    from src.rebalancer.runner import run as _runner_run
 
-    def _dist_pct(r: ScanResult) -> float | None:
-        if r.current_price and r.ma50:
-            return (r.current_price - r.ma50) / r.ma50 * 100
-        return None
+    result, *_ = _runner_run(market, regime=regime)
+    if result.is_hold:
+        return []
 
-    def _compute_exit_ratio(r: ScanResult) -> float:
-        """
-        Dynamic exit sizing based on fundamental valuation (PEG / PS ratio).
+    sell_trades = [t for t in result.trades if t.side == "SELL"]
+    buy_trades  = [t for t in result.trades if t.side == "BUY"]
 
-        PEG ≤ 0.8  → 0.50  strong fundamentals: scale out 50%, retain the rest
-        PEG ≤ 1.5  → 0.75  fair fundamentals:   scale out 75%
-        PEG > 1.5  → 1.00  overvalued / missing: full exit
-        """
-        ratio = _ratio(r)
-        if ratio is None:
-            return 1.0
-        if ratio <= 0.8:
-            return 0.5
-        if ratio <= 1.5:
-            return 0.75
-        return 1.0
+    port_map = {r.ticker: r for r in portfolio_results}
+    disc_map  = {r.ticker: r for r in discovery_results}
 
-    # ── CIRCUIT BREAKER: route overheated tickers to Safe Haven ─────────────
-    _CB_SIGNAL  = "嚴重技術面過熱：強制減倉停利"
-    cash_swaps: list[dict] = []
-    cb_tickers: set[str]   = set()
-
-    # Identify CB tickers first so we only call the safe-haven API once
-    cb_results: list[ScanResult] = [
-        r for r in portfolio_results
-        if not r.error and any(s == _CB_SIGNAL for s in r.signals)
-    ]
-    for r in cb_results:
-        cb_tickers.add(r.ticker)
-
-    # ── Friction-aware routing: BOXX vs pure USD Cash ────────────────────────
-    haven_route:  dict             = {}
-    boxx_result:  ScanResult | None = None
-
-    if cb_tickers:
-        haven_route = _compute_haven_route(DEFAULT_CAPITAL_BLOCK)
-        if haven_route["route"] == "BOXX":
-            boxx_result = _select_safe_haven(SAFE_HAVENS)
-
-    for r in cb_results:
-        ratio_v      = _ratio(r)
-        dist_v       = _dist_pct(r)
-        exit_ratio   = _compute_exit_ratio(r)
-        safe_haven_r = boxx_result   # ScanResult(BOXX) when profitable, else None
-        haven_dist   = (
-            (safe_haven_r.current_price - safe_haven_r.ma50) / safe_haven_r.ma50 * 100
-            if safe_haven_r and safe_haven_r.current_price and safe_haven_r.ma50
-            else None
-        )
-
-        # Register partial exits as dip-buy candidates for re-entry monitoring.
-        if exit_ratio < 1.0:
-            ma50_dist_decimal = (
-                (r.current_price - r.ma50) / r.ma50
-                if r.current_price and r.ma50
-                else None
-            )
-            register_dip_buy_candidate(
-                ticker=r.ticker,
-                peg=ratio_v,
-                exit_ratio=exit_ratio,
-                exit_price=r.current_price,
-                ma50_dist_at_exit=ma50_dist_decimal,
-            )
-
-        cash_swaps.append({
-            "source_ticker":  r,
-            "target_ticker":  safe_haven_r,
-            "sell_score":     calculate_efficiency_score(r, regime=regime),
-            "buy_score":      calculate_efficiency_score(safe_haven_r, regime=regime) if safe_haven_r else 0.0,
-            "score_delta":    999.0,
-            "is_cash_flight": True,
-            "exit_ratio":     exit_ratio,
-            "haven_route":    haven_route,
-            "delta_metrics": {
-                "sell_ratio":       ratio_v,
-                "buy_ratio":        None,
-                "sell_dist_pct":    dist_v,
-                "buy_dist_pct":     haven_dist,
-                "peg_improvement":  None,
-                "dist_improvement": (
-                    (dist_v - haven_dist)
-                    if dist_v is not None and haven_dist is not None
-                    else None
-                ),
-            },
-        })
-        logger.info(
-            "[ROTATION] %s → %s FLIGHT → %s (dist=%.1f%%, exit=%.0f%%)",
-            r.ticker,
-            haven_route.get("route", "CASH"),
-            safe_haven_r.ticker if safe_haven_r else "USD Cash",
-            dist_v or 0.0,
-            exit_ratio * 100,
-        )
-
-    portfolio_scored: list[tuple[ScanResult, float]] = [
-        (r, calculate_efficiency_score(r, regime=regime))
-        for r in portfolio_results
-        if not r.error and r.ticker not in cb_tickers
-        and calculate_efficiency_score(r, regime=regime) > 0.0
-    ]
-    portfolio_scored.sort(key=lambda x: x[1])            # ascending — worst first
-
-    discovery_scored: list[tuple[ScanResult, float]] = [
-        (r, calculate_efficiency_score(r, regime=regime))
-        for r in discovery_results
-        if not r.error and calculate_efficiency_score(r, regime=regime) > 0.0
-    ]
-    discovery_scored.sort(key=lambda x: -x[1])           # descending — best first
-
-    if not portfolio_scored:
-        logger.info("[ROTATION] 無可評分的持倉標的，跳過換倉分析。")
-        return cash_swaps
-    if not discovery_scored:
-        logger.info("[ROTATION] 無可評分的 Discovery 標的，跳過換倉分析。")
-        return cash_swaps
-
-    # ── MACRO CRASH OVERRIDE: suspend all equity swaps ─────────────────────
-    # In a CRASH regime the only permitted operation is moving capital to
-    # USD Cash / BOXX (already in cash_swaps above).  Skip the pairing loop
-    # entirely so no equity-for-equity swaps are emitted.
-    if regime == MarketRegime.CRASH:
-        logger.warning(
-            "[ROTATION] Regime=CRASH — 所有股票換倉建議已暫停，僅保留 %d 組 CASH FLIGHT。",
-            len(cash_swaps),
-        )
-        cash_swaps.sort(key=lambda s: s["score_delta"], reverse=True)
-        return cash_swaps
-
-    # ── Select bottom / top tiers ────────────────────────────────────────────
-    n           = max(1, min(5, len(portfolio_scored) // 4))
-    bottom_tier = portfolio_scored[:n]
-    top_tier    = discovery_scored[:min(5, len(discovery_scored))]
-
-    logger.info(
-        "[ROTATION] Bottom Tier (%d): %s  |  Top Tier (%d): %s",
-        len(bottom_tier), ", ".join(f"{r.ticker}({s:.3f})" for r, s in bottom_tier),
-        len(top_tier),    ", ".join(f"{r.ticker}({s:.3f})" for r, s in top_tier),
-    )
-
-    # ── Pre-Execution Risk Gate: SimulatedPortfolio ──────────────────────────
-    # Instantiate from current (non-error) holdings so the gate evaluates
-    # each candidate against the real portfolio state.
-    # Cash-flight tickers (cb_tickers) remain in the initial state; they are
-    # excluded from bottom_tier so they never enter the pairing loop.  This
-    # makes the gate slightly conservative for subsequent swaps (the sold
-    # cb_tickers still "occupy" their sector weight), which is the safer
-    # direction for a pre-execution limit.
-    sim_portfolio = SimulatedPortfolio.from_scan_results(
-        [r for r in portfolio_results if not r.error],
-        portfolio_df=portfolio_df,
-    )
-
-    # Pre-warm sector cache for all tickers that will appear in gate checks.
-    # Without this, check_sector_limits() would make N yfinance calls on the
-    # first gate evaluation.  Subsequent calls hit the in-process cache.
-    for r in portfolio_results + discovery_results:
-        if not r.error:
-            get_sector(r.ticker)
-
-    # ── Pair — with sector risk gate ─────────────────────────────────────────
-    used_targets: set[str] = set()
     swaps: list[dict] = []
-
-    for sell_r, sell_score in bottom_tier:
-        # Collect all candidates that beat the threshold in score-descending
-        # order (top_tier is already sorted that way).  We try each in turn
-        # until one passes the sector gate.
-        candidates = [
-            (buy_r, buy_score)
-            for buy_r, buy_score in top_tier
-            if buy_r.ticker not in used_targets
-            and buy_score - sell_score > threshold
-        ]
-
-        approved_buy_r:    ScanResult | None = None
-        approved_buy_score: float            = 0.0
-        approved_friction:  dict             = {}
-
-        for buy_r, buy_score in candidates:
-            # Friction is computed per-candidate so the gate uses real cost.
-            friction = estimate_round_trip(sell_r.ticker, buy_r.ticker)
-
-            # Convert friction to the same units as SimulatedPortfolio notional
-            # (total_rate is dimensionless, so multiplying by position value
-            # gives cost in whatever currency/unit the notional is stored in).
-            position_val   = sim_portfolio.get_holdings().get(sell_r.ticker, DEFAULT_CAPITAL_BLOCK)
-            friction_notional = friction["total_rate"] * position_val
-
-            # Fetch target sector (O(1) from cache after pre-warm above)
-            buy_sector = get_sector(buy_r.ticker)
-
-            # Simulate and gate
-            synthetic = sim_portfolio.simulate_swap(
-                sell_r.ticker, buy_r.ticker, friction_notional
-            )
-            if not sim_portfolio.check_sector_limits(synthetic, buy_sector):
-                logger.info(
-                    "[ROTATION] %s → %s REJECTED by risk gate (sector '%s')",
-                    sell_r.ticker, buy_r.ticker, buy_sector,
-                )
-                continue
-
-            # Approved — commit to state and record this candidate
-            sim_portfolio.commit_swap(sell_r.ticker, buy_r.ticker, friction_notional)
-            approved_buy_r     = buy_r
-            approved_buy_score = buy_score
-            approved_friction  = friction
-            break
-
-        if approved_buy_r is None:
-            if candidates:
-                logger.info(
-                    "[ROTATION] %s — %d 個候選標的均被風控閘拒絕，跳過此換倉",
-                    sell_r.ticker, len(candidates),
-                )
+    for sell, buy in zip(sell_trades, buy_trades):
+        src_r = port_map.get(sell.ticker)
+        tgt_r = disc_map.get(buy.ticker) or port_map.get(buy.ticker)
+        if src_r is None or tgt_r is None:
             continue
-
-        used_targets.add(approved_buy_r.ticker)
-
-        sell_ratio = _ratio(sell_r)
-        buy_ratio  = _ratio(approved_buy_r)
-        sell_dist  = _dist_pct(sell_r)
-        buy_dist   = _dist_pct(approved_buy_r)
-
+        sell_score = calculate_efficiency_score(src_r, regime=regime)
+        buy_score  = calculate_efficiency_score(tgt_r, regime=regime)
         swaps.append({
-            "source_ticker": sell_r,
-            "target_ticker": approved_buy_r,
-            "sell_score":    sell_score,
-            "buy_score":     approved_buy_score,
-            "score_delta":   approved_buy_score - sell_score,
-            "friction":      approved_friction,   # pre-computed; reused by _make_rotation_block
+            "source_ticker":    src_r,
+            "target_ticker":    tgt_r,
+            "sell_score":       sell_score,
+            "buy_score":        buy_score,
+            "score_delta":      buy_score - sell_score,
+            "conviction_delta": (buy.conviction - sell.conviction) / 10.0,
+            "friction":         {},
             "delta_metrics": {
-                "peg_improvement":  (sell_ratio - buy_ratio) if sell_ratio is not None and buy_ratio is not None else None,
-                "dist_improvement": (sell_dist  - buy_dist)  if sell_dist  is not None and buy_dist  is not None else None,
-                "sell_ratio":       sell_ratio,
-                "buy_ratio":        buy_ratio,
-                "sell_dist_pct":    sell_dist,
-                "buy_dist_pct":     buy_dist,
+                "sell_ratio":       None,
+                "buy_ratio":        None,
+                "sell_dist_pct":    None,
+                "buy_dist_pct":     None,
+                "peg_improvement":  None,
+                "dist_improvement": None,
             },
+            "is_cash_flight": False,
         })
 
-    all_swaps = cash_swaps + swaps
-    all_swaps.sort(key=lambda s: s["score_delta"], reverse=True)
+    swaps.sort(key=lambda s: s["score_delta"], reverse=True)
     logger.info(
-        "[ROTATION] 完成：%d 組換倉建議（%d CASH FLIGHT, threshold=%.2f）",
-        len(all_swaps), len(cash_swaps), threshold,
+        "[ROTATION] V2.0 adapter — market=%s  build_trades=%d  swap_pairs=%d"
+        " (within-portfolio filtered)",
+        market, len(result.trades), len(swaps),
     )
-    return all_swaps
+    return swaps
 
 
 def find_arbitrage_matches(

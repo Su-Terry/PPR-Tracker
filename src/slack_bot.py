@@ -611,6 +611,9 @@ class SlackWarden:
 
     def _on_rebalance_approve(self, ack: Callable, body: dict, client) -> None:
         """Approve all Execute-tier trades: write actual_trades.jsonl + update state."""
+        from src.rebalancer.trade_builder import Trade as _Trade
+        from src.broker.adapter import ManualAdapter
+
         ack()
         market = body["actions"][0].get("value", "US").upper()
         channel = body["channel"]["id"]
@@ -636,6 +639,7 @@ class SlackWarden:
             )
             return
 
+        adapter = ManualAdapter()
         today = _today_taipei()
         written: list[str] = []
         errors: list[str] = []
@@ -682,19 +686,35 @@ class SlackWarden:
                     "[SLACK] Approve: PortfolioState 更新失敗 %s：%s", ticker, exc
                 )
 
-            logger.info(
-                "[BROKER_STUB] Approve: %s %s %s qty=%.4f", side, ticker, market, quantity
+            trade_obj = _Trade(
+                market=market,
+                ticker=ticker,
+                side=side,
+                delta_weight=float(t.get("delta_weight", 0.0)),
+                target_weight=float(t.get("target_weight", 0.0)),
+                quantity=quantity,
+                est_price=est_price,
+                notional=float(t.get("notional", 0.0)),
+                est_cost=float(t.get("est_cost", 0.0)),
+                est_cost_breakdown=breakdown,
+                conviction=float(t.get("conviction", 0.0)),
+                execution_tier=t.get("execution_tier", "Execute"),
+                rationale=t.get("rationale", ""),
+                bindings=list(t.get("bindings", [])),
             )
-            written.append(f"{side} {ticker} × {quantity:.0f}")
+            adapter.place_order(trade_obj)
+            written.append(
+                f"{side} {ticker} {quantity:.0f} 股"
+                f"  est ${est_price:.2f}  commission ${commission:.2f}"
+            )
 
         if written:
+            lines = [f"✅ 已記錄 {len(written)} 筆交易 (pending_confirmation)"]
+            lines += [f"  {w}" for w in written]
+            lines.append("執行後請至券商 app 確認成交，或使用 `!trade add` 補登實際成本。")
             client.chat_postMessage(
                 channel=channel,
-                text=(
-                    f"✅ 已記錄 {len(written)} 筆 Execute-tier 交易 "
-                    f"(status: pending_confirmation)：\n"
-                    + "\n".join(f"  • {w}" for w in written)
-                ),
+                text="\n".join(lines),
                 thread_ts=msg_ts,
             )
         if errors:
@@ -798,25 +818,387 @@ class SlackWarden:
     # ── Sprint 4: stretch command stubs ───────────────────────────────────────
 
     def _on_stub_cash(self, message: dict, say: Callable, context: dict) -> None:
-        say(text="TODO: Sprint 5 — /cash 命令 (show/set/adjust)")
+        """Handle !cash show [us|tw] and !cash set <market> <amount>. adjust → V2.1."""
+        text  = (message.get("text") or "").strip()
+        parts = text.split()
+        subcmd = parts[1].lower() if len(parts) > 1 else ""
+
+        if subcmd == "show":
+            market_filter = parts[2].upper() if len(parts) > 2 else None
+            if market_filter is not None and market_filter not in ("US", "TW"):
+                say(text="❌ 市場代碼無效（只接受 us / tw）")
+                return
+            try:
+                state = PortfolioState.load(self._state_path)
+            except OSError as exc:
+                say(text=f"❌ 無法讀取狀態：{exc}")
+                return
+            lines = ["💰 *現金部位*"]
+            if market_filter in (None, "US"):
+                lines.append(f"  🇺🇸 US: ${state.us_cash_usd:,.2f} USD")
+            if market_filter in (None, "TW"):
+                lines.append(f"  🇹🇼 TW: NT${state.tw_cash_twd:,.0f}")
+            say(text="\n".join(lines))
+
+        elif subcmd == "set":
+            if len(parts) < 4:
+                say(text="用法：`!cash set <us|tw> <金額>`  例：`!cash set us 5000`")
+                return
+            market = parts[2].upper()
+            if market not in ("US", "TW"):
+                say(text=f"❌ 市場代碼無效：`{parts[2]}`（只接受 us / tw）")
+                return
+            try:
+                new_amount = float(parts[3])
+            except ValueError:
+                say(text=f"❌ 金額格式錯誤：`{parts[3]}`")
+                return
+            try:
+                state = PortfolioState.load(self._state_path)
+                current = state.us_cash_usd if market == "US" else state.tw_cash_twd
+                state.update_cash(market, new_amount - current, reason="!cash set from Slack")
+                state.save(self._state_path)
+            except (OSError, ValueError) as exc:
+                say(text=f"❌ 更新失敗：{exc}")
+                return
+            ccy = "USD" if market == "US" else "NTD"
+            say(text=f"✅ {market} 現金已更新：{new_amount:,.2f} {ccy}")
+
+        elif subcmd == "adjust":
+            say(text="ℹ️ `!cash adjust` 已推遲至 V2.1（需要匯率情境）。請改用 `!cash set`。")
+
+        else:
+            say(text="用法：`!cash show [us|tw]` 或 `!cash set <us|tw> <金額>`")
 
     def _on_stub_holdings_sync(self, message: dict, say: Callable, context: dict) -> None:
-        say(text="TODO: Sprint 5 — /holdings sync (CSV 上傳)")
+        """Handle !holdings sync [us|tw] — sync holdings from latest Cathay CSV in data/."""
+        text  = (message.get("text") or "").strip()
+        parts = text.split()
+        market_arg = parts[2].upper() if len(parts) > 2 else None
+        if market_arg is not None and market_arg not in ("US", "TW"):
+            say(text="用法：`!holdings sync [us|tw]`")
+            return
+
+        from src.data_fetcher import get_portfolio, DATA_DIR as _DATA_DIR
+        portfolio  = get_portfolio(_DATA_DIR)
+        markets    = [market_arg] if market_arg else ["US", "TW"]
+        out_msgs: list[str] = []
+
+        for mkt in markets:
+            file_str = portfolio["files"]["foreign"] if mkt == "US" else portfolio["files"]["tw"]
+            if not file_str:
+                out_msgs.append(f"❌ {mkt}: 找不到 CSV 檔案（請先上傳至 data/）")
+                continue
+            csv_path = Path(file_str)
+            try:
+                state  = PortfolioState.load(self._state_path)
+                before = dict(state.us_holdings if mkt == "US" else state.tw_holdings)
+                warns  = state.sync_holdings_from_csv(csv_path, mkt)
+                state.save(self._state_path)
+                after  = dict(state.us_holdings if mkt == "US" else state.tw_holdings)
+            except (OSError, ValueError) as exc:
+                out_msgs.append(f"❌ {mkt} 同步失敗：{exc}")
+                continue
+            added   = [t for t in after  if t not in before]
+            removed = [t for t in before if t not in after]
+            changed = [t for t in after  if t in before and after[t] != before[t]]
+            diff_lines = (
+                [f"  + {t}: {after[t]:.4f}"                     for t in added]
+                + [f"  - {t}: {before[t]:.4f}"                  for t in removed]
+                + [f"  ~ {t}: {before[t]:.4f}→{after[t]:.4f}"  for t in changed]
+            ) or ["  （無變動）"]
+            warn_str = ("\n  ⚠️ " + "\n  ⚠️ ".join(warns)) if warns else ""
+            out_msgs.append(
+                f"✅ {mkt} 持倉已從 `{csv_path.name}` 同步：\n"
+                + "\n".join(diff_lines)
+                + warn_str
+            )
+
+        say(text="\n\n".join(out_msgs))
 
     def _on_stub_ipo(self, message: dict, say: Callable, context: dict) -> None:
-        say(text="TODO: Sprint 5 — /ipo 命令 (apply/release/list)")
+        """Handle !ipo apply / release / list."""
+        text   = (message.get("text") or "").strip()
+        parts  = text.split()
+        subcmd = parts[1].lower() if len(parts) > 1 else ""
+
+        if subcmd == "apply":
+            if len(parts) < 5:
+                say(text="用法：`!ipo apply <股票代號> <申購金額(NTD)> <撥券日 YYYY-MM-DD>`")
+                return
+            ticker = parts[2].upper()
+            try:
+                amount_twd   = float(parts[3])
+                release_date = parts[4]
+                datetime.strptime(release_date, "%Y-%m-%d")
+            except ValueError as exc:
+                say(text=f"❌ 參數格式錯誤：{exc}")
+                return
+            try:
+                state = PortfolioState.load(self._state_path)
+                if amount_twd > state.tw_cash_twd:
+                    say(text=(
+                        f"❌ TW 現金 NT${state.tw_cash_twd:,.0f} 不足以申購 "
+                        f"NT${amount_twd:,.0f}（差 NT${amount_twd - state.tw_cash_twd:,.0f}）"
+                    ))
+                    return
+                state.add_ipo_subscription(ticker, amount_twd, release_date)
+                state.save(self._state_path)
+            except (OSError, ValueError) as exc:
+                say(text=f"❌ IPO 申購登錄失敗：{exc}")
+                return
+            say(text=f"✅ IPO 申購登錄：{ticker}  NT${amount_twd:,.0f}  撥券日 {release_date}")
+
+        elif subcmd == "release":
+            if len(parts) < 4:
+                say(text="用法：`!ipo release <股票代號> <awarded|refunded>`")
+                return
+            ticker  = parts[2].upper()
+            outcome = parts[3].lower()
+            if outcome not in ("awarded", "refunded"):
+                say(text="❌ outcome 只接受 `awarded` 或 `refunded`")
+                return
+            try:
+                state = PortfolioState.load(self._state_path)
+                state.release_ipo(ticker, outcome)  # type: ignore[arg-type]
+                state.save(self._state_path)
+            except (OSError, ValueError) as exc:
+                say(text=f"❌ IPO release 失敗：{exc}")
+                return
+            emoji = "🎉" if outcome == "awarded" else "🔙"
+            say(text=f"{emoji} {ticker} IPO {outcome} — 狀態已更新")
+
+        elif subcmd == "list":
+            try:
+                state = PortfolioState.load(self._state_path)
+            except OSError as exc:
+                say(text=f"❌ 無法讀取狀態：{exc}")
+                return
+            subs = state.tw_pending_ipo_details
+            if not subs:
+                say(text="ℹ️ 目前無待審 IPO 申購。")
+                return
+            lines = [f"📋 *待審 IPO 申購*  (共 {len(subs)} 筆)"]
+            for sub in subs:
+                lines.append(f"  • {sub.ticker}  NT${sub.amount_twd:,.0f}  撥券日 {sub.release_date}")
+            lines.append(f"  *總扣款：NT${state.tw_pending_ipo_subscription_twd:,.0f}*")
+            say(text="\n".join(lines))
+
+        else:
+            say(text="用法：`!ipo apply <代號> <金額> <日期>` | `!ipo release <代號> awarded|refunded` | `!ipo list`")
 
     def _on_stub_fx(self, message: dict, say: Callable, context: dict) -> None:
-        say(text="TODO: Sprint 5 — /fx record")
+        """Handle !fx record <usd_delta> <twd_delta> — log a USD↔TWD conversion."""
+        text  = (message.get("text") or "").strip()
+        parts = text.split()
+        if len(parts) < 4:
+            say(text="用法：`!fx record <USD 變動> <NTD 變動>`  例：`!fx record -1000 32000`")
+            return
+        try:
+            delta_usd = float(parts[2])
+            delta_twd = float(parts[3])
+        except ValueError:
+            say(text="❌ 金額格式錯誤（需為數字，可為負值）")
+            return
+        try:
+            state = PortfolioState.load(self._state_path)
+            state.update_cash("US", delta_usd, reason="!fx record from Slack")
+            state.update_cash("TW", delta_twd, reason="!fx record from Slack")
+            state.save(self._state_path)
+        except (OSError, ValueError) as exc:
+            say(text=f"❌ FX 記錄失敗：{exc}")
+            return
+        sign_usd = "+" if delta_usd >= 0 else ""
+        sign_twd = "+" if delta_twd >= 0 else ""
+        say(text=(
+            f"✅ FX 換匯已記錄：\n"
+            f"  🇺🇸 US: {sign_usd}{delta_usd:,.2f} USD → ${state.us_cash_usd:,.2f}\n"
+            f"  🇹🇼 TW: {sign_twd}{delta_twd:,.0f} NTD → NT${state.tw_cash_twd:,.0f}"
+        ))
 
     def _on_stub_cost(self, message: dict, say: Callable, context: dict) -> None:
-        say(text="TODO: Sprint 5 — /cost 命令 (show/set/reset)")
+        """Handle !cost show / !cost set <key> <rate> <min> / !cost reset <key>."""
+        text  = (message.get("text") or "").strip()
+        parts = text.split()
+        subcmd    = parts[1].lower() if len(parts) > 1 else ""
+        cost_path = Path("data/cost_profile.json")
+        _VALID_COST_KEYS = ("us_buy", "us_sell", "tw_buy", "tw_sell")
+
+        if subcmd == "show":
+            from src.cost.profile import CostProfile
+            try:
+                profile = CostProfile.load(cost_path)
+            except (OSError, ValueError):
+                profile = CostProfile.from_defaults()
+            lines = ["💹 *成本率設定*"]
+            for key in _VALID_COST_KEYS:
+                entry = getattr(profile, key)
+                lines.append(
+                    f"  `{key}`: rate={entry.rate:.4f}  min={entry.min_cost:.2f}  src={entry.source}"
+                )
+            say(text="\n".join(lines))
+
+        elif subcmd == "set":
+            if len(parts) < 5:
+                say(text="用法：`!cost set <key> <rate> <min_cost>`\n  key: us_buy / us_sell / tw_buy / tw_sell")
+                return
+            key = parts[2].lower()
+            if key not in _VALID_COST_KEYS:
+                say(text=f"❌ key 無效：`{parts[2]}`（只接受 {' / '.join(_VALID_COST_KEYS)}）")
+                return
+            try:
+                rate     = float(parts[3])
+                min_cost = float(parts[4])
+            except ValueError:
+                say(text="❌ 數值格式錯誤（rate 和 min_cost 需為小數）")
+                return
+            from src.cost.profile import CostProfile
+            try:
+                profile = CostProfile.load(cost_path) if cost_path.exists() else CostProfile.from_defaults()
+                profile.manual_set(key, rate, min_cost)
+                profile.save(cost_path)
+            except (OSError, ValueError) as exc:
+                say(text=f"❌ 更新失敗：{exc}")
+                return
+            say(text=f"✅ `{key}` 已更新：rate={rate:.4f}  min={min_cost:.2f}")
+
+        elif subcmd == "reset":
+            if len(parts) < 3:
+                say(text="用法：`!cost reset <key>`\n  key: us_buy / us_sell / tw_buy / tw_sell")
+                return
+            key = parts[2].lower()
+            if key not in _VALID_COST_KEYS:
+                say(text=f"❌ key 無效：`{parts[2]}`（只接受 {' / '.join(_VALID_COST_KEYS)}）")
+                return
+            from src.cost.profile import CostProfile
+            try:
+                profile = CostProfile.load(cost_path) if cost_path.exists() else CostProfile.from_defaults()
+                profile.reset_to_default(key)
+                profile.save(cost_path)
+            except (OSError, ValueError) as exc:
+                say(text=f"❌ 重設失敗：{exc}")
+                return
+            say(text=f"✅ `{key}` 已重設為預設值")
+
+        else:
+            say(text="用法：`!cost show` | `!cost set <key> <rate> <min>` | `!cost reset <key>`")
 
     def _on_stub_reconcile(self, message: dict, say: Callable, context: dict) -> None:
-        say(text="TODO: Sprint 5 — /reconcile 命令")
+        """Handle !reconcile <us|tw> <csv_filename> — report mismatches, no auto-apply."""
+        text  = (message.get("text") or "").strip()
+        parts = text.split()
+        if len(parts) < 3:
+            say(text="用法：`!reconcile <us|tw> <csv_檔名>`  例：`!reconcile us holdings.csv`")
+            return
+        market = parts[1].upper()
+        if market not in ("US", "TW"):
+            say(text="❌ 市場代碼無效（us / tw）")
+            return
+        csv_path = Path("data") / parts[2]
+        if not csv_path.exists():
+            say(text=f"❌ 找不到檔案：`data/{parts[2]}`（請先上傳至 data/ 目錄）")
+            return
+        from src.portfolio.reconcile import reconcile_from_csv
+        try:
+            state  = PortfolioState.load(self._state_path)
+            report = reconcile_from_csv(csv_path, market, state)
+        except (OSError, ValueError) as exc:
+            say(text=f"❌ Reconcile 失敗：{exc}")
+            return
+        say(text=report.to_slack_text())
 
     def _on_stub_rebalance_config(self, message: dict, say: Callable, context: dict) -> None:
-        say(text="TODO: Sprint 5 — /rebalance config 命令")
+        import dataclasses
+        import json
+        import os
+        from src.rebalancer.config import RebalanceConfig
+
+        _CONFIG_PATH   = Path("data/rebalance_config_override.json")
+        _INT_FIELDS    = frozenset({"lookback_days_min", "lookback_days_ideal"})
+        _VALID_FIELDS  = frozenset(
+            f.name for f in dataclasses.fields(RebalanceConfig) if f.name != "market"
+        )
+
+        text  = message.get("text", "").strip()
+        parts = text.split()
+        # parts: ["!rebalance", "config", <show|set>, ...]
+
+        subcmd = parts[2] if len(parts) >= 3 else ""
+        if subcmd not in ("show", "set"):
+            say(text=(
+                "用法：\n"
+                "  `!rebalance config show [us|tw]`\n"
+                "  `!rebalance config set <us|tw> <field> <value>`"
+            ))
+            return
+
+        overrides: dict = {}
+        if _CONFIG_PATH.exists():
+            try:
+                overrides = json.loads(_CONFIG_PATH.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+
+        if subcmd == "show":
+            market_filter = parts[3].upper() if len(parts) >= 4 else None
+            markets = [market_filter] if market_filter in ("US", "TW") else ["US", "TW"]
+            lines: list[str] = []
+            for mkt in markets:
+                defaults = RebalanceConfig.us_default() if mkt == "US" else RebalanceConfig.tw_default()
+                mkt_ov = overrides.get(mkt, {})
+                lines.append(f"*{mkt} config overrides*")
+                if not mkt_ov:
+                    lines.append("  _（無 override — 使用預設值）_")
+                else:
+                    for field, val in mkt_ov.items():
+                        default_val = getattr(defaults, field, "?")
+                        lines.append(f"  `{field}`: `{val}`  _(default: {default_val})_")
+            say(text="\n".join(lines))
+            return
+
+        # set
+        if len(parts) < 6:
+            say(text="用法：`!rebalance config set <us|tw> <field> <value>`")
+            return
+
+        mkt = parts[3].upper()
+        if mkt not in ("US", "TW"):
+            say(text=f"❌ market 無效：`{parts[3]}`（只接受 `us` / `tw`）")
+            return
+
+        field = parts[4]
+        if field not in _VALID_FIELDS:
+            say(text=(
+                f"❌ field 無效：`{field}`\n"
+                f"可接受欄位：{', '.join(f'`{f}`' for f in sorted(_VALID_FIELDS))}"
+            ))
+            return
+
+        try:
+            coerced: int | float = int(parts[5]) if field in _INT_FIELDS else float(parts[5])
+        except ValueError:
+            say(text=f"❌ value 必須是數字：`{parts[5]}`")
+            return
+
+        overrides.setdefault(mkt, {})[field] = coerced
+
+        _CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = _CONFIG_PATH.with_suffix(".json.tmp")
+        try:
+            tmp.write_text(
+                json.dumps(overrides, indent=2, ensure_ascii=False), encoding="utf-8"
+            )
+            os.replace(tmp, _CONFIG_PATH)
+        except Exception as exc:
+            say(text=f"❌ 寫入失敗：{exc}")
+            return
+
+        defaults = RebalanceConfig.us_default() if mkt == "US" else RebalanceConfig.tw_default()
+        default_val = getattr(defaults, field, "?")
+        say(text=(
+            f"✅ {mkt} `{field}` → `{coerced}`  _(default: {default_val})_\n"
+            "（下次 runner.run() 生效）"
+        ))
 
     # ── V1.1: Text command handler ────────────────────────────────────────────
 
