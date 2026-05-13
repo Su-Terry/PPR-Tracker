@@ -10,7 +10,8 @@ Objective (spec §4.2):
 Constraints (spec §4.3):
     w ≥ 0                            (non-negative weights)
     Σ w = 1                          (fully invested)
-    w ≤ max_position                 (single-ticker cap)
+    w[i] ≤ max_position              (single-ticker cap, equity only — CASH exempt)
+    w[i] ≤ w0[i]  for over-cap i    (trim-only: over-cap positions cannot grow)
     B @ w ≤ max_sector               (sector cap, per L1 sector row)
     w[cash_idx] ≥ effective_cash_floor
     ‖w − w0‖₁ ≤ max_turnover
@@ -18,11 +19,17 @@ Constraints (spec §4.3):
 Post-processing (spec §4.6):
     Weights below min_position are zeroed, remaining weights re-normalised.
 
-Infeasibility relaxation (spec §11):
-    Relax max_turnover → max_sector → cash_floor, each by +5 pp, max 3 attempts.
-    On final infeasibility the function returns w0 with is_hold=True, infeasible=True
-    rather than raising, so Sprint 4 dashboard can display the HOLD reason.
-    Deviation from spec §4.6 (which says raise) — disclosed in spec deviation D2.
+Infeasibility relaxation (spec §11 + D-S5-16/17/18):
+    When over-cap positions exist (w0[i] > max_position, i ≠ cash_idx):
+        max_turnover → max_sector → max_position → cash_floor  (4 steps)
+    Otherwise:
+        max_turnover → max_sector → cash_floor                 (3 steps)
+
+    max_position relaxation: +5 pp per step, hard cap at _MAX_POSITION_RELAX_CAP=0.30.
+    On final infeasibility returns w0 with is_hold=True, infeasible=True.
+    hold_reason="manual_trim_required" when over-cap positions caused the failure;
+    hold_reason="infeasible" for clean portfolios.
+    Deviation from spec §4.6 (which says raise) — disclosed as spec deviation D2.
 
 HOLD detection (spec §4.7):
     If ‖w* − w0‖₁ < config.min_total_turnover the result is HOLD.
@@ -42,8 +49,8 @@ from src.rebalancer.config import RebalanceConfig
 
 logger = logging.getLogger(__name__)
 
-_RELAX_STEP = 0.05
-_MAX_RELAX_ATTEMPTS = 3
+_RELAX_STEP             = 0.05
+_MAX_POSITION_RELAX_CAP = 0.30   # absolute ceiling for max_position relaxation (D-S5-18)
 
 
 @dataclass
@@ -61,16 +68,17 @@ class OptimizeResult:
         the total turnover is below min_total_turnover, or because the
         solver was infeasible after all relaxation attempts.
     hold_reason:
-        "infeasible"   — solver could not find a feasible solution
-        "min_turnover" — ‖w* − w0‖₁ < config.min_total_turnover
-        None           — actionable result (not a HOLD)
+        "infeasible"           — solver infeasible, no over-cap positions
+        "manual_trim_required" — solver infeasible, over-cap positions present
+        "min_turnover"         — ‖w* − w0‖₁ < config.min_total_turnover
+        None                   — actionable result (not a HOLD)
     infeasible:
         True only when infeasibility triggered the HOLD. Distinct from
         hold_reason for programmatic checks (e.g. Sprint 4 /why endpoint).
     relaxations_applied:
         Human-readable list of the constraint relaxations that were attempted
         before declaring infeasibility. Empty when the first solve succeeded.
-        Example: ["max_turnover: 0.40→0.45", "max_sector: 0.40→0.45"]
+        Example: ["max_turnover: 0.40→0.45", "max_position: 0.20→0.25"]
     solver_status:
         The cvxpy problem status string from the final solve attempt.
     """
@@ -101,7 +109,7 @@ def solve_target_weights(
         Current weight vector (length N, must sum to ~1, non-negative).
     scores:
         Score vector (length N), z-score standardised by the caller.
-        High score = more attractive. Assembled from quant_engine in Sprint 5.
+        High score = more attractive.
     cov:
         N×N annualised covariance matrix from CovEstimate.matrix.
     sector_matrix:
@@ -119,13 +127,25 @@ def solve_target_weights(
     OptimizeResult
     """
     cash_floor = effective_cash_floor if effective_cash_floor is not None else config.cash_floor
+    n = len(w0)
+
+    # Equity positions whose current weight exceeds the position cap (CASH exempt).
+    # These positions may hold or trim but cannot grow — see D-S5-17.
+    over_cap_indices: list[int] = [
+        i for i in range(n)
+        if i != cash_idx and w0[i] > config.max_position
+    ]
+
+    # 4-step relaxation chain when over-cap positions exist, 3-step otherwise.
+    max_relax = 4 if over_cap_indices else 3
 
     relaxations: list[str] = []
     current_max_turnover = config.max_turnover
-    current_max_sector = config.max_sector
-    current_cash_floor = cash_floor
+    current_max_sector   = config.max_sector
+    current_max_position = config.max_position
+    current_cash_floor   = cash_floor
 
-    for attempt in range(_MAX_RELAX_ATTEMPTS + 1):
+    for attempt in range(max_relax + 1):
         result = _solve_once(
             w0=w0,
             scores=scores,
@@ -135,7 +155,9 @@ def solve_target_weights(
             cash_idx=cash_idx,
             max_turnover=current_max_turnover,
             max_sector=current_max_sector,
+            max_position=current_max_position,
             cash_floor=current_cash_floor,
+            over_cap_indices=over_cap_indices,
         )
 
         if result is not None:
@@ -167,30 +189,41 @@ def solve_target_weights(
                 solver_status=status,
             )
 
-        if attempt < _MAX_RELAX_ATTEMPTS:
-            relaxations.append(_relax_one(
+        if attempt < max_relax:
+            relax_msg = _relax_one(
                 attempt=attempt,
                 current_max_turnover=current_max_turnover,
                 current_max_sector=current_max_sector,
+                current_max_position=current_max_position,
                 current_cash_floor=current_cash_floor,
-                config=config,
-            ))
-            current_max_turnover, current_max_sector, current_cash_floor = _updated_params(
+                has_over_cap=bool(over_cap_indices),
+            )
+            relaxations.append(relax_msg)
+            (
+                current_max_turnover,
+                current_max_sector,
+                current_max_position,
+                current_cash_floor,
+            ) = _updated_params(
                 attempt=attempt,
                 current_max_turnover=current_max_turnover,
                 current_max_sector=current_max_sector,
+                current_max_position=current_max_position,
                 current_cash_floor=current_cash_floor,
+                has_over_cap=bool(over_cap_indices),
             )
 
+    hold_reason = "manual_trim_required" if over_cap_indices else "infeasible"
     logger.warning(
-        "[OPT] Infeasible after %d relaxation attempts: %s",
-        _MAX_RELAX_ATTEMPTS,
+        "[OPT] %s after %d relaxation attempts: %s",
+        hold_reason,
+        max_relax,
         relaxations,
     )
     return OptimizeResult(
         w_target=w0.copy(),
         is_hold=True,
-        hold_reason="infeasible",
+        hold_reason=hold_reason,
         infeasible=True,
         relaxations_applied=relaxations,
         solver_status="infeasible",
@@ -206,12 +239,19 @@ def _solve_once(
     cash_idx: int,
     max_turnover: float,
     max_sector: float,
+    max_position: float,
     cash_floor: float,
+    over_cap_indices: list[int],
 ) -> tuple[np.ndarray, str] | None:
     """
     Attempt one QP solve. Returns (w_value, status) on success, None on
     INFEASIBLE / UNBOUNDED / error.
     """
+    assert cash_idx not in over_cap_indices, (
+        "CASH must not appear in over_cap_indices "
+        "(verified by solve_target_weights filter)"
+    )
+
     n = len(w0)
     w = cp.Variable(n, nonneg=True)
 
@@ -221,9 +261,12 @@ def _solve_once(
         + config.lambda_turnover * cp.norm1(w - w0)
     )
 
-    constraints = [
+    # Position cap excludes CASH (D-S5-16): cash is bounded only by cash_floor below.
+    # Trim-only (D-S5-17): over-cap positions may hold or trim, never grow.
+    constraints: list = [
         cp.sum(w) == 1,
-        w <= config.max_position,
+        *[w[i] <= max_position for i in range(n) if i != cash_idx],
+        *[w[i] <= float(w0[i]) for i in over_cap_indices],
         sector_matrix @ w <= max_sector,
         w[cash_idx] >= cash_floor,
         cp.norm1(w - w0) <= max_turnover,
@@ -247,19 +290,28 @@ def _relax_one(
     attempt: int,
     current_max_turnover: float,
     current_max_sector: float,
+    current_max_position: float,
     current_cash_floor: float,
-    config: RebalanceConfig,
+    has_over_cap: bool,
 ) -> str:
-    """Return a human-readable description of which relaxation will be applied."""
+    """Return a human-readable description of the relaxation being applied."""
     if attempt == 0:
         new_val = current_max_turnover + _RELAX_STEP
         msg = f"max_turnover: {current_max_turnover:.2f}→{new_val:.2f}"
     elif attempt == 1:
         new_val = current_max_sector + _RELAX_STEP
         msg = f"max_sector: {current_max_sector:.2f}→{new_val:.2f}"
-    else:
+    elif attempt == 2 and has_over_cap:
+        new_val = min(current_max_position + _RELAX_STEP, _MAX_POSITION_RELAX_CAP)
+        msg = f"max_position: {current_max_position:.2f}→{new_val:.2f}"
+    elif (attempt == 2 and not has_over_cap) or (attempt == 3 and has_over_cap):
         new_val = max(current_cash_floor - _RELAX_STEP, 0.0)
         msg = f"cash_floor: {current_cash_floor:.2f}→{new_val:.2f}"
+    else:
+        raise ValueError(
+            f"Unexpected relaxation state: attempt={attempt}, "
+            f"has_over_cap={has_over_cap}"
+        )
     logger.warning("[OPT] Relaxing constraint — %s", msg)
     return msg
 
@@ -268,14 +320,24 @@ def _updated_params(
     attempt: int,
     current_max_turnover: float,
     current_max_sector: float,
+    current_max_position: float,
     current_cash_floor: float,
-) -> tuple[float, float, float]:
+    has_over_cap: bool,
+) -> tuple[float, float, float, float]:
     if attempt == 0:
-        return current_max_turnover + _RELAX_STEP, current_max_sector, current_cash_floor
+        return current_max_turnover + _RELAX_STEP, current_max_sector, current_max_position, current_cash_floor
     elif attempt == 1:
-        return current_max_turnover, current_max_sector + _RELAX_STEP, current_cash_floor
+        return current_max_turnover, current_max_sector + _RELAX_STEP, current_max_position, current_cash_floor
+    elif attempt == 2 and has_over_cap:
+        new_mp = min(current_max_position + _RELAX_STEP, _MAX_POSITION_RELAX_CAP)
+        return current_max_turnover, current_max_sector, new_mp, current_cash_floor
+    elif (attempt == 2 and not has_over_cap) or (attempt == 3 and has_over_cap):
+        return current_max_turnover, current_max_sector, current_max_position, max(current_cash_floor - _RELAX_STEP, 0.0)
     else:
-        return current_max_turnover, current_max_sector, max(current_cash_floor - _RELAX_STEP, 0.0)
+        raise ValueError(
+            f"Unexpected relaxation state: attempt={attempt}, "
+            f"has_over_cap={has_over_cap}"
+        )
 
 
 def _apply_min_position(w: np.ndarray, min_position: float) -> np.ndarray:

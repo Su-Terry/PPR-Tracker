@@ -48,16 +48,22 @@ class RateEntry:
 
     rate:      Fraction of notional charged (e.g. 0.0001 = 0.01%).
     min_cost:  Minimum charge in market native currency (USD for US, NTD for TW).
+    tax_rate:  Statutory per-notional tax added on top of commission (e.g. US SEC
+               fee 0.0000206). Defaults to 0.0 (no tax). TW sell statutory tax is
+               handled at profile level via tw_sec_tax, not here.
     source:    "default" | "manual_override" | "learned".
     n_samples: Number of actual_cost observations (V2.1 learning; None until then).
     """
     rate: float
     min_cost: float
     source: Literal["default", "manual_override", "learned"]
+    tax_rate: float = 0.0
     n_samples: int | None = None
 
     def to_dict(self) -> dict:
         d: dict = {"rate": self.rate, "min": self.min_cost, "source": self.source}
+        if self.tax_rate != 0.0:
+            d["tax_rate"] = self.tax_rate
         if self.n_samples is not None:
             d["n_samples"] = self.n_samples
         return d
@@ -68,6 +74,7 @@ class RateEntry:
             rate=float(d["rate"]),
             min_cost=float(d["min"]),
             source=d.get("source", "default"),
+            tax_rate=float(d.get("tax_rate", 0.0)),
             n_samples=d.get("n_samples"),
         )
 
@@ -238,6 +245,7 @@ class CostProfile:
         """
         entry = self._get_entry(market, side)
         cost = max(entry.rate * notional, entry.min_cost)
+        cost += entry.tax_rate * notional
         if market == "TW" and side == "SELL":
             cost += self.tw_sec_tax * notional
         return round(cost, 6)
