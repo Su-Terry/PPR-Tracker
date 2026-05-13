@@ -98,7 +98,7 @@ class TestLivePriceProvider:
 
     # ── no internal logger suppression (thread-safety guarantee) ─────────────
 
-    def test_no_setlevel_called_during_fetch(
+    def test_does_not_call_getlogger_yfinance(
         self, provider: LivePriceProvider
     ) -> None:
         """LivePriceProvider must not mutate shared yfinance logger level."""
