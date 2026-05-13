@@ -428,7 +428,7 @@ def build_scheduler() -> BackgroundScheduler:
     # US: before NYSE open (09:30 NY = 21:00 Taipei prev day), Sun–Thu
     scheduler.add_job(
         func=_pre_market_scan,
-        trigger=CronTrigger(day_of_week="sun-thu", hour=21, minute=0),
+        trigger=CronTrigger(day_of_week="sun,mon,tue,wed,thu", hour=21, minute=0),
         kwargs={"market": "US"},
         id="us_premarket",
         name="美股開盤前掃描（V2.0 推播）",
@@ -449,7 +449,7 @@ def build_scheduler() -> BackgroundScheduler:
     # US: after NYSE close (16:00 NY = 05:00 Taipei next day), Tue–Sat
     scheduler.add_job(
         func=_post_market_archive,
-        trigger=CronTrigger(day_of_week="tue-sat", hour=5, minute=0),
+        trigger=CronTrigger(day_of_week="tue,wed,thu,fri,sat", hour=5, minute=0),
         kwargs={"market": "US"},
         id="us_postmarket",
         name="美股收盤後歸檔（靜默）",
