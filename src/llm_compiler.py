@@ -22,7 +22,6 @@ from datetime import datetime
 from typing import Literal
 
 import pandas as pd
-import yfinance as yf
 from google import genai
 from google.genai import types
 
@@ -45,8 +44,10 @@ from src.state_manager import (
     remove_dip_buy_candidate,
 )
 from src.strategies.scoring import efficiency_score as calculate_efficiency_score
+from src.data.price_provider import LivePriceProvider
 
 logger = logging.getLogger(__name__)
+_price_provider = LivePriceProvider()
 
 _MODEL      = "gemini-2.0-flash"
 _MAX_TOKENS = 2048
@@ -109,23 +110,12 @@ def _spot_price(bare_code: str, exchange: str) -> float | None:
     primary   = ".TW"  if exchange == "TWSE" else ".TWO"
     secondary = ".TWO" if primary  == ".TW"  else ".TW"
 
-    # Pre-listing IPO stocks legitimately return HTTP 404 from Yahoo Finance.
-    # Suppress yfinance's ERROR-level logs here — a missing price is expected,
-    # not exceptional; the caller handles None gracefully.
-    yf_log = logging.getLogger("yfinance")
-    prev   = yf_log.level
-    yf_log.setLevel(logging.CRITICAL)
-    try:
-        for suffix in (primary, secondary):
-            try:
-                info = yf.Ticker(f"{bare_code}{suffix}").fast_info
-                price = getattr(info, "last_price", None)
-                if price and float(price) > 0:
-                    return float(price)
-            except Exception:
-                continue
-    finally:
-        yf_log.setLevel(prev)
+    # Pre-listing IPO stocks may not be listed yet — None return is expected
+    # and handled gracefully by the caller.
+    for suffix in (primary, secondary):
+        price = _price_provider.get_current_price(f"{bare_code}{suffix}")
+        if price and price > 0:
+            return price
     return None
 
 
