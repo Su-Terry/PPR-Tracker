@@ -31,8 +31,10 @@ from src.strategies.quant_engine import (
     calculate_ps_growth_ratio,
     check_momentum_trend,
 )
+from src.data.price_provider import LivePriceProvider
 
 logger = logging.getLogger(__name__)
+_price_provider = LivePriceProvider()
 
 DATA_DIR              = Path("data")
 PRICE_HISTORY_PERIOD  = "1y"
@@ -1210,21 +1212,12 @@ def get_valuation_data(bare_code: str, exchange: str = "TPEX") -> dict:
 
     # ── Reference price: Priority 2 — yfinance (listed stocks) ──────────────
     if result["ref_price"] is None:
-        suffix  = ".TW" if exchange == "TWSE" else ".TWO"
-        yf_log  = logging.getLogger("yfinance")
-        yf_prev = yf_log.level
-        yf_log.setLevel(logging.CRITICAL)
-        try:
-            fast = _yf.Ticker(f"{bare_code}{suffix}").fast_info
-            px   = getattr(fast, "last_price", None)
-            if px and float(px) > 0:
-                result["ref_price"] = float(px)
-                logger.info("[VALUATION] %s ref_price from yfinance: %.2f",
-                            bare_code, result["ref_price"])
-        except Exception:
-            pass
-        finally:
-            yf_log.setLevel(yf_prev)
+        suffix = ".TW" if exchange == "TWSE" else ".TWO"
+        px = _price_provider.get_current_price(f"{bare_code}{suffix}")
+        if px and px > 0:
+            result["ref_price"] = px
+            logger.info("[VALUATION] %s ref_price from yfinance: %.2f",
+                        bare_code, result["ref_price"])
 
     # ── Market median P/E ─────────────────────────────────────────────────────
     result["market_pe"] = _fetch_market_median_pe(exchange)
